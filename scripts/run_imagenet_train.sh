@@ -18,7 +18,7 @@ esac
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${PYTHON:-python}"
 gpu_id="${GPU_ID:-0}"
-out_root="${OUT_ROOT:-$root/runs/imagenet_train}"
+out_root="${OUT_ROOT:-/app/output/imagenet_train}"
 
 is_imagenet_train_dir() {
     local candidate="$1"
@@ -48,6 +48,7 @@ resolve_imagenet_train_dir() {
     fi
 
     candidates+=(
+        "/app/data/ImageNet-2012/train"
         "$root/data/imagenet/train"
         "$root/data/ILSVRC2012_img_train"
         "/app/scratch/datasets/imagenet/train"
