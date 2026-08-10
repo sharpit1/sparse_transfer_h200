@@ -1,0 +1,8 @@
+# Install torch/torchvision from the PyTorch index appropriate for the H200
+# CUDA runtime before installing this file when the default PyPI wheel is not
+# suitable for the host.
+numpy>=1.26,<3
+Pillow>=10,<13
+tqdm>=4.65,<5
+torch>=2.11,<2.13
+torchvision>=0.26,<0.28

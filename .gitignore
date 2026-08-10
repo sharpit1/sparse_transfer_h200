@@ -1,0 +1,8 @@
+/.cache/
+/runs/
+/.venv/
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+*.log
