@@ -83,6 +83,26 @@ class NIPS2017SmokeTests(unittest.TestCase):
         self.assertIn("0.25", damping_025)
         self.assertIn("0.5", damping_050)
 
+    def test_imagenet_launchers_fix_full_training_protocol(self) -> None:
+        common = (ROOT / "scripts" / "run_imagenet_train.sh").read_text(
+            encoding="utf-8"
+        )
+        damping_025 = (
+            ROOT / "scripts" / "run_imagenet_train_damping_025.sh"
+        ).read_text(encoding="utf-8")
+        damping_050 = (
+            ROOT / "scripts" / "run_imagenet_train_damping_050.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("--batch_size 16", common)
+        self.assertIn("--epochs 15", common)
+        self.assertIn("--ddsc_warmup_epochs 2", common)
+        self.assertIn("--num_workers 8", common)
+        self.assertNotIn("--train_csv", common)
+        self.assertIn("1000", common)
+        self.assertIn("0.25", damping_025)
+        self.assertIn("0.5", damping_050)
+
 
 if __name__ == "__main__":
     unittest.main()
