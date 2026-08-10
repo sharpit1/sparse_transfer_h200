@@ -19,7 +19,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${PYTHON:-python}"
 gpu_id="${GPU_ID:-0}"
 data_root="$root/data/nips2017_smoke"
-out_root="${OUT_ROOT:-$root/runs/nips2017_smoke}"
+out_root="${OUT_ROOT:-/app/output/nips2017_smoke}"
 
 if [[ ! -f "$data_root/images.csv" ]]; then
     echo "missing NIPS2017 smoke metadata: $data_root/images.csv" >&2

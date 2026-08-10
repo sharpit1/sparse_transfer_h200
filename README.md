@@ -52,15 +52,17 @@ Or run both sequentially:
 bash scripts/run_nips2017_smoke_both.sh
 ```
 
-Outputs are written under `runs/nips2017_smoke/` and are ignored by Git.
+Outputs are written under `/app/output/nips2017_smoke/`.
 Override the location with `OUT_ROOT=/path/to/output`.
 
 ## Full ImageNet train set
 
 The ImageNet training root must use torchvision `ImageFolder` layout with
 exactly 1,000 class directories, normally WordNet IDs such as `n01440764`.
-The FaaS launcher checks an explicit path, `IMAGENET_TRAIN_DIR`, standard
-mount locations, and sibling input mounts in that order.
+The FaaS launcher checks an explicit path, `IMAGENET_TRAIN_DIR`,
+`/app/data/ImageNet-2012/train`, other standard mount locations, and sibling
+input mounts in that order. The training launcher does not use the sibling
+`/app/data/ImageNet-2012/val` directory.
 
 Run one damping variant:
 
@@ -85,7 +87,8 @@ bash scripts/run_imagenet_train_both.sh
 
 The full protocol uses batch size 16, all samples, 15 epochs, two warm-up
 epochs, eight DataLoader workers, and an epoch checkpoint interval of one.
-Outputs are written under `runs/imagenet_train/`.
+Outputs are written under `/app/output/imagenet_train/`. Override the location
+with `OUT_ROOT=/path/to/output`.
 
 ## Data and attribution
 
