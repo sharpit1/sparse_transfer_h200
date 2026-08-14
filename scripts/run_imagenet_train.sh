@@ -18,7 +18,16 @@ esac
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${PYTHON:-python}"
 gpu_id="${GPU_ID:-0}"
-out_root="${OUT_ROOT:-/app/output/imagenet_train}"
+out_root="${OUT_ROOT:-/app/output/sharpit1}"
+generator_mode="${GENERATOR_MODE:-isolated}"
+
+case "$generator_mode" in
+    isolated|legacy) ;;
+    *)
+        echo "GENERATOR_MODE must be isolated or legacy" >&2
+        exit 2
+        ;;
+esac
 
 is_imagenet_train_dir() {
     local candidate="$1"
@@ -98,6 +107,7 @@ mkdir -p "$TORCH_HOME" "$out_root"
 exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
     --train_dir "$train_dir" \
     --model_type res50 \
+    --generator_mode "$generator_mode" \
     --eps 10 \
     --target -1 \
     --batch_size 16 \

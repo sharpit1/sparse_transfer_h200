@@ -1,8 +1,26 @@
 # DDSC-GPG H200 smoke runs
 
-This repository packages the isolated DDSC-GPG trainer and a licensed
+This repository packages the dual-mode DDSC-GPG trainer and a licensed
 16-image NIPS2017 subset for reproducible GPU smoke testing. Two launchers use
 the same data and optimization settings while changing only DDSC damping.
+
+## Generator modes
+
+The trainer defaults to `isolated`, which uses the frozen ResNet-50 layer1
+encoder and shared-lite decoder. Select `legacy` to use the original learned
+dual-encoder GPG generator while retaining DDSC dynamic lambda-1, pixel-space
+PGD guidance, and the configured attack-objective Dropout-EOT behavior.
+
+The supplied launchers expose the selection through `GENERATOR_MODE`:
+
+```bash
+GENERATOR_MODE=legacy bash scripts/run_nips2017_smoke_damping_025.sh
+GENERATOR_MODE=legacy bash scripts/run_imagenet_train_damping_025.sh
+```
+
+Training checkpoints are mode-specific. Continuation rejects a checkpoint if
+its generator mode differs from the requested mode. Existing v6/v7 training
+and v2 inference checkpoints remain readable as `isolated` checkpoints.
 
 ## Fixed smoke settings
 
