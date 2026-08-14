@@ -14,7 +14,9 @@ try:
         ISOLATED_DECODER_DEFAULTS,
         build_generator_from_inference_checkpoint,
         build_parser,
+        optimizer_spec_for_generator,
         validate_args,
+        validate_optimizer_state_dict,
     )
     from third_party.GPG.generators_ddsc_gpg import DDSCGPGGenerator
     from third_party.GPG.generators_legacy_gpg import (
@@ -106,6 +108,36 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
                         restored.architecture_metadata(),
                         loaded["architecture"],
                     )
+
+    def test_legacy_natural_adam_step_satisfies_checkpoint_contract(self) -> None:
+        generator = LegacyGPGGenerator()
+        learning_rate = 2.25e-5
+        optimizer = torch.optim.Adam(
+            list(generator.trainable_parameters()),
+            lr=learning_rate,
+            betas=(0.5, 0.999),
+        )
+        image = torch.rand(1, 3, 32, 32)
+
+        adv, adv_inf, _, adv_00 = generator(image, 10 / 255.0)
+        (adv.mean() + adv_inf.square().mean() + adv_00.mean()).backward()
+        optimizer.step()
+
+        expected_parameters = [
+            (name, parameter)
+            for name, parameter in generator.named_parameters()
+            if parameter.requires_grad
+        ]
+        validate_optimizer_state_dict(
+            optimizer.state_dict(),
+            optimizer_spec_for_generator(
+                generator,
+                expected_lr=learning_rate,
+            ),
+            expected_lr=learning_rate,
+            expected_step=1,
+            expected_parameters=expected_parameters,
+        )
 
 
 if __name__ == "__main__":

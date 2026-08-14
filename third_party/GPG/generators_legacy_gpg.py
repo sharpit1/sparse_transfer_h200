@@ -105,6 +105,13 @@ class LegacyGPGGenerator(nn.Module):
             nn.BatchNorm2d(NGF * 4),
             nn.ReLU(True),
         )
+        for gradient_encoder_block in (
+            self.Grad_block1,
+            self.Grad_block2,
+            self.Grad_block3,
+        ):
+            gradient_encoder_block.requires_grad_(False)
+            gradient_encoder_block.eval()
 
         self.upsampl_inf1 = self._upsample_block(NGF * 4, NGF * 2)
         self.upsampl_inf2 = self._upsample_block(NGF * 2, NGF)
@@ -141,6 +148,16 @@ class LegacyGPGGenerator(nn.Module):
         return (
             parameter for parameter in self.parameters() if parameter.requires_grad
         )
+
+    def train(self, mode: bool = True) -> "LegacyGPGGenerator":
+        super().train(mode)
+        # DDSC uses pixel-space PGD guidance and never calls this preserved
+        # legacy feature encoder.  Keep it immutable while retaining every
+        # historical state-dict key for raw legacy checkpoint compatibility.
+        self.Grad_block1.eval()
+        self.Grad_block2.eval()
+        self.Grad_block3.eval()
+        return self
 
     def _clean_encode(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feature = self.block3(self.block2(self.block1(image)))
@@ -218,7 +235,11 @@ class LegacyGPGGenerator(nn.Module):
                 "variant": "legacy_learned_dual",
                 "base_channels": NGF,
                 "downsample_stages": 2,
-                "gradient_branch": True,
+                "gradient_branch": {
+                    "present": True,
+                    "frozen": True,
+                    "used_by_ddsc": False,
+                },
                 "frozen": False,
             },
             "decoder": {
@@ -229,7 +250,7 @@ class LegacyGPGGenerator(nn.Module):
                 "shared_upsample_trunk": False,
             },
             "mask_training": "gpg_stochastic_soft_or_detached_hard",
-            "legacy_feature_guidance": "available_but_unused_by_ddsc",
+            "legacy_feature_guidance": "preserved_frozen_unused_by_ddsc",
             "crop_policy": (
                 "legacy_remove_top_row_and_right_column"
                 if self.inception
