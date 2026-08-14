@@ -169,6 +169,69 @@ def generator_mode_for_type(generator_type: str) -> str:
     return matches[0]
 
 
+def _legacy_feature_guidance_contract(
+    architecture: Mapping[str, Any],
+) -> str:
+    """Classify legacy metadata without trusting it for state reconstruction."""
+
+    encoder = architecture.get("encoder")
+    if not isinstance(encoder, Mapping):
+        return "invalid"
+    gradient_branch = encoder.get("gradient_branch")
+    feature_guidance = architecture.get("legacy_feature_guidance")
+    if isinstance(gradient_branch, Mapping):
+        if (
+            gradient_branch.get("present") is True
+            and gradient_branch.get("frozen") is False
+            and gradient_branch.get("used_by_ddsc") is True
+            and feature_guidance == "enabled_trainable_by_ddsc"
+        ):
+            return "trainable"
+        if (
+            gradient_branch.get("present") is True
+            and gradient_branch.get("frozen") is True
+            and gradient_branch.get("used_by_ddsc") is False
+            and feature_guidance == "preserved_frozen_unused_by_ddsc"
+        ):
+            return "frozen_unused"
+    if (
+        gradient_branch is True
+        and feature_guidance == "available_but_unused_by_ddsc"
+    ):
+        return "unversioned_unused"
+    return "invalid"
+
+
+def _legacy_inference_architecture_matches_current(
+    architecture: Mapping[str, Any],
+    current_architecture: Mapping[str, Any],
+) -> bool:
+    """Allow only the historical feature-guidance metadata difference."""
+
+    if _legacy_feature_guidance_contract(architecture) not in {
+        "frozen_unused",
+        "unversioned_unused",
+    }:
+        return False
+    encoder = architecture.get("encoder")
+    current_encoder = current_architecture.get("encoder")
+    if not isinstance(encoder, Mapping) or not isinstance(
+        current_encoder,
+        Mapping,
+    ):
+        return False
+    normalized_architecture = dict(architecture)
+    normalized_encoder = dict(encoder)
+    normalized_encoder["gradient_branch"] = current_encoder.get(
+        "gradient_branch"
+    )
+    normalized_architecture["encoder"] = normalized_encoder
+    normalized_architecture["legacy_feature_guidance"] = (
+        current_architecture.get("legacy_feature_guidance")
+    )
+    return _values_equal_exact(normalized_architecture, current_architecture)
+
+
 @dataclass(frozen=True)
 class DDSCControllerConfig:
     """Second-order feedback-controller configuration for lambda-1."""
@@ -1871,6 +1934,15 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         raise ValueError(
             "checkpoint architecture generator_type is inconsistent"
         )
+    if (
+        payload["train_args"]["generator_mode"] == "legacy"
+        and _legacy_feature_guidance_contract(payload["architecture"])
+        != "trainable"
+    ):
+        raise ValueError(
+            "legacy training checkpoint does not use trainable feature guidance; "
+            "restart legacy training under the current objective"
+        )
     required_train_args = set(RESUME_EXACT_ARGS) | {"epochs"}
     missing_train_args = required_train_args - set(payload["train_args"])
     if missing_train_args:
@@ -1954,6 +2026,12 @@ def load_inference_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]
         raise ValueError(
             "inference architecture generator_type is inconsistent"
         )
+    if (
+        generator_mode == "legacy"
+        and _legacy_feature_guidance_contract(payload["architecture"])
+        not in {"trainable", "frozen_unused", "unversioned_unused"}
+    ):
+        raise ValueError("legacy inference feature-guidance metadata is incompatible")
     validate_module_state_dict_finite(
         payload["generator_state_dict"],
         field_name="generator_state_dict",
@@ -2033,10 +2111,18 @@ def build_generator_from_inference_checkpoint(
             field_name="loaded_generator_state_dict",
         )
         generator.eval()
-        if not _values_equal_exact(
+        architecture_matches = _values_equal_exact(
             generator.architecture_metadata(),
             architecture,
-        ):
+        )
+        legacy_inference_compatible = (
+            generator_mode == "legacy"
+            and _legacy_inference_architecture_matches_current(
+                architecture,
+                generator.architecture_metadata(),
+            )
+        )
+        if not architecture_matches and not legacy_inference_compatible:
             raise ValueError(
                 "reconstructed inference architecture does not match metadata"
             )
@@ -2830,8 +2916,8 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         )
     else:
         LOGGER.info(
-            "legacy dual-encoder generator selected; DDSC uses pixel-space PGD "
-            "guidance and does not call the optional feature-guidance branch"
+            "legacy dual-encoder generator selected; DDSC uses both pixel-space "
+            "PGD guidance and the original trainable feature-guidance branch"
         )
     LOGGER.info(
         "attack_objective layer1_dropout_mode=%s p=%.6g channel_ratio=%.6g "
@@ -2911,7 +2997,18 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
 
             net_g.train()
             optimizer.zero_grad(set_to_none=True)
-            adv, adv_inf, adv_0, adv_00 = net_g(image, args.eps / 255.0)
+            if args.generator_mode == "legacy":
+                adv, adv_inf, adv_0, adv_00, feature_guidance_loss = net_g(
+                    image,
+                    args.eps / 255.0,
+                    image + grad_delta,
+                )
+            else:
+                adv, adv_inf, adv_0, adv_00 = net_g(
+                    image,
+                    args.eps / 255.0,
+                )
+                feature_guidance_loss = adv.new_zeros(())
             grad_guided_loss = torch.sum((adv_inf - grad_delta) ** 2)
             loss_adv, adv_logits = attack_model_loss_and_logits(
                 attack_objective_model,
@@ -2940,6 +3037,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 + lambda1_applied * loss_spa
                 + args.lam_2 * loss_qua
                 + args.lam_3 * grad_guided_loss
+                + args.lam_3 * feature_guidance_loss
             )
             loss.backward()
             optimizer.step()
