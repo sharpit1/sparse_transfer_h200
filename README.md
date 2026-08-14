@@ -9,7 +9,9 @@ the same data and optimization settings while changing only DDSC damping.
 The trainer defaults to `isolated`, which uses the frozen ResNet-50 layer1
 encoder and shared-lite decoder. Select `legacy` to use the original learned
 dual-encoder GPG generator while retaining DDSC dynamic lambda-1, pixel-space
-PGD guidance, and the configured attack-objective Dropout-EOT behavior.
+PGD guidance, the original trainable feature-guidance loss, and the configured
+attack-objective Dropout-EOT behavior. In `legacy` mode, `Grad_block1` through
+`Grad_block3` are trainable and receive the feature-guidance gradient.
 
 The supplied launchers expose the selection through `GENERATOR_MODE`:
 
@@ -19,8 +21,11 @@ GENERATOR_MODE=legacy bash scripts/run_imagenet_train_damping_025.sh
 ```
 
 Training checkpoints are mode-specific. Continuation rejects a checkpoint if
-its generator mode differs from the requested mode. Existing v6/v7 training
-and v2 inference checkpoints remain readable as `isolated` checkpoints.
+its generator mode differs from the requested mode. Legacy training
+checkpoints created while the gradient encoder was frozen cannot be resumed,
+because they used a different objective and optimizer parameter set; their
+inference checkpoints remain readable. Existing v6/v7 training and v2
+inference checkpoints remain readable as `isolated` checkpoints.
 
 ## Fixed smoke settings
 

@@ -2,9 +2,8 @@
 
 The learnable module names intentionally match the original GPG
 ``GeneratorResnet`` implementation so legacy state dictionaries retain their
-established key layout.  DDSC training uses the four-output forward path and
-keeps its pixel-space PGD guidance loss; the optional fifth feature-guidance
-output remains available for callers that provide ``grad_AE``.
+established key layout.  DDSC legacy training supplies ``grad_AE`` and uses
+both the pixel-space PGD guidance loss and the fifth feature-guidance output.
 """
 
 from __future__ import annotations
@@ -105,14 +104,6 @@ class LegacyGPGGenerator(nn.Module):
             nn.BatchNorm2d(NGF * 4),
             nn.ReLU(True),
         )
-        for gradient_encoder_block in (
-            self.Grad_block1,
-            self.Grad_block2,
-            self.Grad_block3,
-        ):
-            gradient_encoder_block.requires_grad_(False)
-            gradient_encoder_block.eval()
-
         self.upsampl_inf1 = self._upsample_block(NGF * 4, NGF * 2)
         self.upsampl_inf2 = self._upsample_block(NGF * 2, NGF)
         self.blockf_inf = nn.Sequential(
@@ -148,16 +139,6 @@ class LegacyGPGGenerator(nn.Module):
         return (
             parameter for parameter in self.parameters() if parameter.requires_grad
         )
-
-    def train(self, mode: bool = True) -> "LegacyGPGGenerator":
-        super().train(mode)
-        # DDSC uses pixel-space PGD guidance and never calls this preserved
-        # legacy feature encoder.  Keep it immutable while retaining every
-        # historical state-dict key for raw legacy checkpoint compatibility.
-        self.Grad_block1.eval()
-        self.Grad_block2.eval()
-        self.Grad_block3.eval()
-        return self
 
     def _clean_encode(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feature = self.block3(self.block2(self.block1(image)))
@@ -237,8 +218,8 @@ class LegacyGPGGenerator(nn.Module):
                 "downsample_stages": 2,
                 "gradient_branch": {
                     "present": True,
-                    "frozen": True,
-                    "used_by_ddsc": False,
+                    "frozen": False,
+                    "used_by_ddsc": True,
                 },
                 "frozen": False,
             },
@@ -250,7 +231,7 @@ class LegacyGPGGenerator(nn.Module):
                 "shared_upsample_trunk": False,
             },
             "mask_training": "gpg_stochastic_soft_or_detached_hard",
-            "legacy_feature_guidance": "preserved_frozen_unused_by_ddsc",
+            "legacy_feature_guidance": "enabled_trainable_by_ddsc",
             "crop_policy": (
                 "legacy_remove_top_row_and_right_column"
                 if self.inception

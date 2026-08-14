@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,13 +11,20 @@ try:
     import torchvision
 
     from third_party.GPG.DDSC_GPG_train import (
+        CHECKPOINT_FORMAT,
         INFERENCE_CHECKPOINT_FORMAT,
         ISOLATED_DECODER_DEFAULTS,
         build_generator_from_inference_checkpoint,
         build_parser,
+        controller_config_from_args,
+        initial_controller_state,
+        load_training_checkpoint,
         optimizer_spec_for_generator,
+        runtime_contract,
+        save_epoch_checkpoints,
         validate_args,
         validate_optimizer_state_dict,
+        validate_resume_metadata,
     )
     from third_party.GPG.generators_ddsc_gpg import DDSCGPGGenerator
     from third_party.GPG.generators_legacy_gpg import (
@@ -109,7 +117,91 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
                         loaded["architecture"],
                     )
 
-    def test_legacy_natural_adam_step_satisfies_checkpoint_contract(self) -> None:
+    def test_frozen_legacy_inference_checkpoint_remains_readable(self) -> None:
+        generator = LegacyGPGGenerator(eps=10 / 255.0)
+        architecture = copy.deepcopy(generator.architecture_metadata())
+        architecture["encoder"]["gradient_branch"] = {
+            "present": True,
+            "frozen": True,
+            "used_by_ddsc": False,
+        }
+        architecture["legacy_feature_guidance"] = (
+            "preserved_frozen_unused_by_ddsc"
+        )
+        payload = {
+            "kind": "inference",
+            "generator_type": generator.generator_type,
+            "model_type": "res50",
+            "target": -1,
+            "eps_pixels": 10,
+            "image_size": 224,
+            "completed_epoch": 0,
+            "architecture": architecture,
+            "generator_state_dict": generator.state_dict(),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frozen_legacy.inference.pth"
+            torch.save((INFERENCE_CHECKPOINT_FORMAT, payload), path)
+
+            restored, loaded = build_generator_from_inference_checkpoint(path)
+
+            corrupted_payload = copy.deepcopy(payload)
+            corrupted_payload["architecture"]["decoder"]["base_channels"] += 1
+            corrupted_path = Path(directory) / "corrupted_legacy.inference.pth"
+            torch.save(
+                (INFERENCE_CHECKPOINT_FORMAT, corrupted_payload),
+                corrupted_path,
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "reconstructed inference architecture",
+            ):
+                build_generator_from_inference_checkpoint(corrupted_path)
+
+        self.assertEqual(restored.generator_type, generator.generator_type)
+        self.assertEqual(list(restored.state_dict()), list(generator.state_dict()))
+        self.assertEqual(loaded["architecture"], architecture)
+
+    def test_frozen_legacy_training_checkpoint_requires_restart(self) -> None:
+        generator = LegacyGPGGenerator()
+        architecture = copy.deepcopy(generator.architecture_metadata())
+        architecture["encoder"]["gradient_branch"] = {
+            "present": True,
+            "frozen": True,
+            "used_by_ddsc": False,
+        }
+        architecture["legacy_feature_guidance"] = (
+            "preserved_frozen_unused_by_ddsc"
+        )
+        train_args = vars(
+            build_parser().parse_args(["--generator_mode", "legacy"])
+        )
+        payload = {
+            "kind": "training",
+            "checkpoint_boundary": "post_epoch_post_controller_update",
+            "generator_type": generator.generator_type,
+            "generator_state_dict": generator.state_dict(),
+            "attack_model_contract": {},
+            "optimizer_state_dict": {},
+            "optimizer_spec": {},
+            "controller_config": {},
+            "controller_state": {},
+            "completed_epoch": 0,
+            "next_epoch": 1,
+            "train_args": train_args,
+            "architecture": architecture,
+            "rng_state": {},
+            "dataset_contract": {},
+            "runtime_contract": {},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frozen_legacy.train.pth"
+            torch.save((CHECKPOINT_FORMAT, payload), path)
+
+            with self.assertRaisesRegex(ValueError, "restart legacy training"):
+                load_training_checkpoint(path)
+
+    def test_legacy_feature_guidance_trains_and_round_trips_checkpoints(self) -> None:
         generator = LegacyGPGGenerator()
         learning_rate = 2.25e-5
         optimizer = torch.optim.Adam(
@@ -118,9 +210,31 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
             betas=(0.5, 0.999),
         )
         image = torch.rand(1, 3, 32, 32)
+        gradient_adversarial_image = torch.rand_like(image)
 
-        adv, adv_inf, _, adv_00 = generator(image, 10 / 255.0)
-        (adv.mean() + adv_inf.square().mean() + adv_00.mean()).backward()
+        adv, adv_inf, _, adv_00, feature_guidance = generator(
+            image,
+            10 / 255.0,
+            gradient_adversarial_image,
+        )
+        (
+            adv.mean()
+            + adv_inf.square().mean()
+            + adv_00.mean()
+            + feature_guidance
+        ).backward()
+        gradient_encoder_parameters = [
+            parameter
+            for name, parameter in generator.named_parameters()
+            if name.startswith("Grad_block")
+        ]
+        self.assertTrue(gradient_encoder_parameters)
+        self.assertTrue(
+            all(parameter.requires_grad for parameter in gradient_encoder_parameters)
+        )
+        self.assertTrue(
+            all(parameter.grad is not None for parameter in gradient_encoder_parameters)
+        )
         optimizer.step()
 
         expected_parameters = [
@@ -137,6 +251,51 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
             expected_lr=learning_rate,
             expected_step=1,
             expected_parameters=expected_parameters,
+        )
+
+        args = build_parser().parse_args(
+            [
+                "--generator_mode",
+                "legacy",
+                "--device",
+                "cpu",
+                "--epochs",
+                "2",
+            ]
+        )
+        controller_config = controller_config_from_args(args)
+        attack_model_manifest = {
+            "schema": 1,
+            "model_type": "res50",
+            "architecture": "resnet50",
+            "weights_enum": "IMAGENET1K_V1",
+            "state_sha256": "0" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            inference_path, training_path = save_epoch_checkpoints(
+                output_path=Path(directory),
+                epoch=0,
+                net_g=generator,
+                optimizer=optimizer,
+                controller_config=controller_config,
+                controller_state=initial_controller_state(controller_config),
+                args=args,
+                data_loader_generator=torch.Generator().manual_seed(0),
+                attack_model_manifest=attack_model_manifest,
+                dataset_manifest={"sample_count": 1},
+                runtime_manifest=runtime_contract(torch.device("cpu")),
+            )
+
+            training_payload = load_training_checkpoint(training_path)
+            validate_resume_metadata(training_payload, args, controller_config)
+            restored, inference_payload = (
+                build_generator_from_inference_checkpoint(inference_path)
+            )
+
+        self.assertEqual(restored.generator_type, generator.generator_type)
+        self.assertEqual(
+            inference_payload["architecture"],
+            generator.architecture_metadata(),
         )
 
 
