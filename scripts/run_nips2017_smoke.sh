@@ -20,6 +20,15 @@ python_bin="${PYTHON:-python}"
 gpu_id="${GPU_ID:-0}"
 data_root="$root/data/nips2017_smoke"
 out_root="${OUT_ROOT:-/app/output/nips2017_smoke}"
+generator_mode="${GENERATOR_MODE:-isolated}"
+
+case "$generator_mode" in
+    isolated|legacy) ;;
+    *)
+        echo "GENERATOR_MODE must be isolated or legacy" >&2
+        exit 2
+        ;;
+esac
 
 if [[ ! -f "$data_root/images.csv" ]]; then
     echo "missing NIPS2017 smoke metadata: $data_root/images.csv" >&2
@@ -38,6 +47,7 @@ exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
     --train_dir "$data_root/images" \
     --train_csv "$data_root/images.csv" \
     --model_type res50 \
+    --generator_mode "$generator_mode" \
     --eps 10 \
     --target -1 \
     --batch_size 16 \

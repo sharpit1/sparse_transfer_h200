@@ -102,7 +102,7 @@ class NIPS2017SmokeTests(unittest.TestCase):
         self.assertNotIn("--train_csv", common)
         self.assertIn("1000", common)
         self.assertIn("/app/data/ImageNet-2012/train", common)
-        self.assertIn("/app/output/imagenet_train", common)
+        self.assertIn("/app/output/sharpit1", common)
         self.assertIn("0.25", damping_025)
         self.assertIn("0.5", damping_050)
 
