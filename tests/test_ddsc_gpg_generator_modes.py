@@ -17,6 +17,8 @@ try:
         build_generator_from_inference_checkpoint,
         build_parser,
         controller_config_from_args,
+        epoch_timing_metrics,
+        expected_optimizer_step,
         initial_controller_state,
         load_training_checkpoint,
         optimizer_spec_for_generator,
@@ -57,12 +59,53 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
     ) -> None:
         parser = build_parser()
         self.assertEqual(parser.parse_args([]).generator_mode, "isolated")
+        self.assertEqual(parser.parse_args([]).max_batches_per_epoch, 0)
 
         legacy_args = parser.parse_args(["--generator_mode", "legacy"])
         validate_args(legacy_args)
         legacy_args.decoder_width = ISOLATED_DECODER_DEFAULTS["decoder_width"] + 1
         with self.assertRaisesRegex(ValueError, "configure only the isolated"):
             validate_args(legacy_args)
+
+        invalid_batch_limit_args = parser.parse_args(
+            ["--max_batches_per_epoch", "-1"]
+        )
+        with self.assertRaisesRegex(ValueError, "max_batches_per_epoch"):
+            validate_args(invalid_batch_limit_args)
+
+    def test_batch_limit_controls_optimizer_steps_and_timing_metrics(self) -> None:
+        dataset_manifest = {"sample_count": 1_281_167}
+
+        self.assertEqual(
+            expected_optimizer_step(
+                next_epoch=15,
+                dataset_manifest=dataset_manifest,
+                batch_size=16,
+                max_batches_per_epoch=16,
+            ),
+            240,
+        )
+        self.assertEqual(
+            expected_optimizer_step(
+                next_epoch=1,
+                dataset_manifest=dataset_manifest,
+                batch_size=16,
+                max_batches_per_epoch=0,
+            ),
+            80_073,
+        )
+        self.assertEqual(
+            epoch_timing_metrics(
+                elapsed_seconds=8.0,
+                processed_batches=16,
+                processed_samples=256,
+            ),
+            {
+                "seconds": 8.0,
+                "batches_per_second": 2.0,
+                "images_per_second": 32.0,
+            },
+        )
 
     def test_both_modes_implement_the_ddsc_four_output_forward_contract(self) -> None:
         generators = (
@@ -261,6 +304,8 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
                 "cpu",
                 "--epochs",
                 "2",
+                "--max_batches_per_epoch",
+                "1",
             ]
         )
         controller_config = controller_config_from_args(args)
@@ -282,7 +327,7 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
                 args=args,
                 data_loader_generator=torch.Generator().manual_seed(0),
                 attack_model_manifest=attack_model_manifest,
-                dataset_manifest={"sample_count": 1},
+                dataset_manifest={"sample_count": 17},
                 runtime_manifest=runtime_contract(torch.device("cpu")),
             )
 

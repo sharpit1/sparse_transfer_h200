@@ -20,6 +20,24 @@ GENERATOR_MODE=legacy bash scripts/run_nips2017_smoke_damping_025.sh
 GENERATOR_MODE=legacy bash scripts/run_imagenet_train_damping_025.sh
 ```
 
+For an ImageNet timing smoke run that performs exactly 16 training batches in
+one epoch, use:
+
+```bash
+GENERATOR_MODE=legacy OUT_ROOT=/app/output/sharpit1 bash scripts/run_imagenet_smoke_16_batches_damping_025.sh
+```
+
+The trainer prints synchronized epoch seconds, batches/second, and
+images/second. The launcher also prints total process wall time, including
+model loading, dataset discovery, and checkpoint writing.
+
+ImageNet launchers keep support smoothing disabled by default. Override it for
+one run without editing the checkout:
+
+```bash
+DDSC_EMA_DECAY=0.5 GENERATOR_MODE=legacy OUT_ROOT=/app/output/sharpit1 bash scripts/run_imagenet_train_damping_025.sh
+```
+
 Training checkpoints are mode-specific. Continuation rejects a checkpoint if
 its generator mode differs from the requested mode. Legacy training
 checkpoints created while the gradient encoder was frozen cannot be resumed,

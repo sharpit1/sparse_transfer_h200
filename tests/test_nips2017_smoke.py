@@ -96,7 +96,10 @@ class NIPS2017SmokeTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("--batch_size 16", common)
-        self.assertIn("--epochs 15", common)
+        self.assertIn('train_epochs="${TRAIN_EPOCHS:-15}"', common)
+        self.assertIn('max_batches_per_epoch="${MAX_BATCHES_PER_EPOCH:-0}"', common)
+        self.assertIn('ddsc_ema_decay="${DDSC_EMA_DECAY:-0.0}"', common)
+        self.assertIn('--ddsc_ema_decay "$ddsc_ema_decay"', common)
         self.assertIn("--ddsc_warmup_epochs 2", common)
         self.assertIn("--num_workers 8", common)
         self.assertNotIn("--train_csv", common)
@@ -105,6 +108,23 @@ class NIPS2017SmokeTests(unittest.TestCase):
         self.assertIn("/app/output/sharpit1", common)
         self.assertIn("0.25", damping_025)
         self.assertIn("0.5", damping_050)
+
+    def test_imagenet_timing_smoke_processes_exactly_16_batches(self) -> None:
+        common = (ROOT / "scripts" / "run_imagenet_train.sh").read_text(
+            encoding="utf-8"
+        )
+        timing_smoke = (
+            ROOT / "scripts" / "run_imagenet_smoke_16_batches_damping_025.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('--epochs "$train_epochs"', common)
+        self.assertIn(
+            '--max_batches_per_epoch "$max_batches_per_epoch"',
+            common,
+        )
+        self.assertIn("TRAIN_EPOCHS=1", timing_smoke)
+        self.assertIn("MAX_BATCHES_PER_EPOCH=16", timing_smoke)
+        self.assertIn("imagenet_smoke_total_seconds=", timing_smoke)
 
 
 if __name__ == "__main__":

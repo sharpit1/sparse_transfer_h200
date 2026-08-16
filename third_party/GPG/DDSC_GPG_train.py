@@ -29,10 +29,12 @@ import os
 import platform
 import random
 import threading
+import time
 import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -124,6 +126,7 @@ RESUME_EXACT_ARGS = (
     "eps",
     "target",
     "batch_size",
+    "max_batches_per_epoch",
     "sample_per_class",
     "n_iters",
     "lr",
@@ -613,6 +616,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum samples per class; 0 uses all samples",
     )
     parser.add_argument("--n_iters", type=int, default=1)
+    parser.add_argument(
+        "--max_batches_per_epoch",
+        type=int,
+        default=0,
+        help="maximum training batches per epoch; 0 processes the full loader",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=2.25e-5)
     parser.add_argument(
@@ -747,8 +756,15 @@ def validate_args(args: argparse.Namespace) -> None:
     for name, value in positive.items():
         if not math.isfinite(float(value)) or value <= 0:
             raise ValueError(f"--{name} must be finite and positive")
-    if args.sample_per_class < 0 or args.num_workers < 0:
-        raise ValueError("sample_per_class and num_workers must be non-negative")
+    if (
+        args.sample_per_class < 0
+        or args.max_batches_per_epoch < 0
+        or args.num_workers < 0
+    ):
+        raise ValueError(
+            "sample_per_class, max_batches_per_epoch, and num_workers "
+            "must be non-negative"
+        )
     if args.decoder_num_blocks < 0:
         raise ValueError("decoder_num_blocks must be non-negative")
     if args.generator_mode == "legacy":
@@ -829,6 +845,7 @@ def _normalize_checkpoint_train_args(
     if not isinstance(stored_args, Mapping):
         raise ValueError("checkpoint train_args must be a mapping")
     normalized = dict(stored_args)
+    normalized.setdefault("max_batches_per_epoch", 0)
     dropout_keys = set(LAYER1_DROPOUT_DEFAULTS)
     present = dropout_keys.intersection(normalized)
     if checkpoint_format == CHECKPOINT_FORMAT:
@@ -2210,6 +2227,7 @@ def validate_resume_metadata(
             next_epoch=next_epoch,
             dataset_manifest=payload["dataset_contract"],
             batch_size=args.batch_size,
+            max_batches_per_epoch=args.max_batches_per_epoch,
         ),
     )
 
@@ -2219,15 +2237,44 @@ def expected_optimizer_step(
     next_epoch: int,
     dataset_manifest: Mapping[str, Any],
     batch_size: int,
+    max_batches_per_epoch: int = 0,
 ) -> int:
     if type(next_epoch) is not int or next_epoch <= 0:
         raise ValueError("next_epoch must be a positive plain integer")
     if type(batch_size) is not int or batch_size <= 0:
         raise ValueError("batch_size must be a positive plain integer")
+    if type(max_batches_per_epoch) is not int or max_batches_per_epoch < 0:
+        raise ValueError(
+            "max_batches_per_epoch must be a non-negative plain integer"
+        )
     sample_count = dataset_manifest.get("sample_count")
     if type(sample_count) is not int or sample_count <= 0:
         raise ValueError("dataset sample_count must be a positive plain integer")
-    return next_epoch * math.ceil(sample_count / batch_size)
+    batches_per_epoch = math.ceil(sample_count / batch_size)
+    if max_batches_per_epoch > 0:
+        batches_per_epoch = min(batches_per_epoch, max_batches_per_epoch)
+    return next_epoch * batches_per_epoch
+
+
+def epoch_timing_metrics(
+    *,
+    elapsed_seconds: float,
+    processed_batches: int,
+    processed_samples: int,
+) -> dict[str, float]:
+    """Return stable epoch throughput metrics after synchronized training."""
+
+    if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0.0:
+        raise ValueError("elapsed_seconds must be finite and positive")
+    if type(processed_batches) is not int or processed_batches <= 0:
+        raise ValueError("processed_batches must be a positive plain integer")
+    if type(processed_samples) is not int or processed_samples <= 0:
+        raise ValueError("processed_samples must be a positive plain integer")
+    return {
+        "seconds": float(elapsed_seconds),
+        "batches_per_second": processed_batches / elapsed_seconds,
+        "images_per_second": processed_samples / elapsed_seconds,
+    }
 
 
 def expected_adam_group_options(expected_lr: float) -> dict[str, Any]:
@@ -2534,6 +2581,7 @@ def save_epoch_checkpoints(
             next_epoch=epoch + 1,
             dataset_manifest=dataset_manifest,
             batch_size=args.batch_size,
+            max_batches_per_epoch=args.max_batches_per_epoch,
         ),
         expected_parameters=[
             (name, parameter)
@@ -2779,6 +2827,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             ),
             dataset_manifest=resume_payload["dataset_contract"],
             batch_size=args.batch_size,
+            max_batches_per_epoch=args.max_batches_per_epoch,
         )
         validate_optimizer_state_dict(
             resume_payload["optimizer_state_dict"],
@@ -2961,13 +3010,24 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         # Match the historical one-base-seed-per-epoch sampler transition while
         # the private worker generator handles persistent-worker seeding.
         _consume_epoch_base_seed(data_loader_generator)
+        epoch_batch_total = len(train_loader)
+        if args.max_batches_per_epoch > 0:
+            epoch_batch_total = min(
+                epoch_batch_total,
+                args.max_batches_per_epoch,
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        epoch_start_time = time.perf_counter()
         training_batches = _iter_training_batches(
             train_loader,
             num_workers=args.num_workers,
             worker_timeout_seconds=args.worker_timeout_seconds,
         )
+        limited_training_batches = islice(training_batches, epoch_batch_total)
+        processed_batches = 0
         for batch_index, (image, ground_truth) in enumerate(
-            tqdm(training_batches, total=len(train_loader))
+            tqdm(limited_training_batches, total=epoch_batch_total)
         ):
             image = image.to(device, non_blocking=True)
             ground_truth = ground_truth.to(device, non_blocking=True)
@@ -3043,6 +3103,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             optimizer.step()
 
             batch_size_actual = image.shape[0]
+            processed_batches += 1
             batch_support = hard_spatial_support(adv_00)
             support_sum += float(batch_support.sum().item())
             support_samples += batch_size_actual
@@ -3080,7 +3141,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     "qua=%.3f FR=%.4f",
                     epoch,
                     batch_index,
-                    len(train_loader),
+                    epoch_batch_total,
                     lambda1_applied,
                     last_metrics["l0"],
                     last_metrics["l1"],
@@ -3109,12 +3170,40 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
 
         if support_samples == 0:
             raise RuntimeError("training loader produced no samples")
+        if processed_batches != epoch_batch_total:
+            raise RuntimeError(
+                "training loader ended before the configured epoch batch count: "
+                f"processed={processed_batches}, expected={epoch_batch_total}"
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timing = epoch_timing_metrics(
+            elapsed_seconds=time.perf_counter() - epoch_start_time,
+            processed_batches=processed_batches,
+            processed_samples=support_samples,
+        )
         observed_k = support_sum / support_samples
         fool_rate_epoch = fool_count_epoch / support_samples
         print(
             f"running:{epoch} | FR-{args.model_type}:{fool_rate_epoch:.6f} | "
             f"lambda1:{lambda1_applied:.9g} | support:{observed_k:.3f}/"
             f"{target_k}"
+        )
+        print(
+            f"timing:{epoch} | batches:{processed_batches} | "
+            f"samples:{support_samples} | seconds:{timing['seconds']:.3f} | "
+            f"batches/s:{timing['batches_per_second']:.3f} | "
+            f"images/s:{timing['images_per_second']:.3f}"
+        )
+        LOGGER.info(
+            "epoch_timing epoch=%d batches=%d samples=%d seconds=%.9g "
+            "batches_per_second=%.9g images_per_second=%.9g",
+            epoch,
+            processed_batches,
+            support_samples,
+            timing["seconds"],
+            timing["batches_per_second"],
+            timing["images_per_second"],
         )
         LOGGER.info(
             "epoch_summary epoch=%d FR=%.9g lambda1_applied=%.9g "
@@ -3228,6 +3317,7 @@ __all__ = [
     "cw_loss",
     "ddsc_controller_transition",
     "dataset_contract",
+    "epoch_timing_metrics",
     "experiment_fingerprint",
     "expected_adam_group_options",
     "expected_optimizer_step",
