@@ -100,6 +100,45 @@ class NIPS2017SmokeTests(unittest.TestCase):
         self.assertIn('max_batches_per_epoch="${MAX_BATCHES_PER_EPOCH:-0}"', common)
         self.assertIn('ddsc_ema_decay="${DDSC_EMA_DECAY:-0.0}"', common)
         self.assertIn('--ddsc_ema_decay "$ddsc_ema_decay"', common)
+        self.assertIn(
+            'layer1_dropout_mode="${LAYER1_DROPOUT_MODE:-off}"',
+            common,
+        )
+        self.assertIn('layer1_dropout_p="${LAYER1_DROPOUT_P:-0.4}"', common)
+        self.assertIn(
+            'layer1_dropout_channel_ratio="${LAYER1_DROPOUT_CHANNEL_RATIO:-0.3}"',
+            common,
+        )
+        self.assertIn(
+            'layer1_dropout_hf_ratio="${LAYER1_DROPOUT_HF_RATIO:-0.35}"',
+            common,
+        )
+        self.assertIn(
+            'layer1_dropout_eot_samples="${LAYER1_DROPOUT_EOT_SAMPLES:-4}"',
+            common,
+        )
+        self.assertIn(
+            'layer1_dropout_eot_reduction="${LAYER1_DROPOUT_EOT_REDUCTION:-logits}"',
+            common,
+        )
+        self.assertIn('--layer1_dropout_mode "$layer1_dropout_mode"', common)
+        self.assertIn('--layer1_dropout_p "$layer1_dropout_p"', common)
+        self.assertIn(
+            '--layer1_dropout_channel_ratio "$layer1_dropout_channel_ratio"',
+            common,
+        )
+        self.assertIn(
+            '--layer1_dropout_hf_ratio "$layer1_dropout_hf_ratio"',
+            common,
+        )
+        self.assertIn(
+            '--layer1_dropout_eot_samples "$layer1_dropout_eot_samples"',
+            common,
+        )
+        self.assertIn(
+            '--layer1_dropout_eot_reduction "$layer1_dropout_eot_reduction"',
+            common,
+        )
         self.assertIn("--ddsc_warmup_epochs 2", common)
         self.assertIn("--num_workers 8", common)
         self.assertNotIn("--train_csv", common)
