@@ -20,6 +20,9 @@ python_bin="${PYTHON:-python}"
 gpu_id="${GPU_ID:-0}"
 out_root="${OUT_ROOT:-/app/output/sharpit1}"
 generator_mode="${GENERATOR_MODE:-isolated}"
+train_epochs="${TRAIN_EPOCHS:-15}"
+max_batches_per_epoch="${MAX_BATCHES_PER_EPOCH:-0}"
+ddsc_ema_decay="${DDSC_EMA_DECAY:-0.0}"
 
 case "$generator_mode" in
     isolated|legacy) ;;
@@ -28,6 +31,15 @@ case "$generator_mode" in
         exit 2
         ;;
 esac
+
+if [[ ! "$train_epochs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TRAIN_EPOCHS must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! "$max_batches_per_epoch" =~ ^[0-9]+$ ]]; then
+    echo "MAX_BATCHES_PER_EPOCH must be a non-negative integer" >&2
+    exit 2
+fi
 
 is_imagenet_train_dir() {
     local candidate="$1"
@@ -94,7 +106,7 @@ resolve_imagenet_train_dir() {
 
 train_dir="$(resolve_imagenet_train_dir "${2:-}")"
 echo "imagenet_train_dir=$train_dir"
-echo "batch_size=16 epochs=15 warmup_epochs=2 damping=$damping"
+echo "batch_size=16 epochs=$train_epochs max_batches_per_epoch=$max_batches_per_epoch warmup_epochs=2 damping=$damping ema_decay=$ddsc_ema_decay"
 
 export CUDA_VISIBLE_DEVICES="$gpu_id"
 export TORCH_HOME="${TORCH_HOME:-$root/.cache/torch}"
@@ -113,7 +125,8 @@ exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
     --batch_size 16 \
     --sample_per_class 0 \
     --n_iters 1 \
-    --epochs 15 \
+    --max_batches_per_epoch "$max_batches_per_epoch" \
+    --epochs "$train_epochs" \
     --lr 2.25e-5 \
     --lam_1 0.0001 \
     --lam_2 0.0001 \
@@ -131,7 +144,7 @@ exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
     --save_every 1 \
     --ddsc_target_density 0.10 \
     --ddsc_warmup_epochs 2 \
-    --ddsc_ema_decay 0.0 \
+    --ddsc_ema_decay "$ddsc_ema_decay" \
     --ddsc_mass 1.0 \
     --ddsc_damping "$damping" \
     --ddsc_restoring_gain 0.0001 \
