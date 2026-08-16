@@ -38,6 +38,17 @@ one run without editing the checkout:
 DDSC_EMA_DECAY=0.5 GENERATOR_MODE=legacy OUT_ROOT=/app/output/sharpit1 bash scripts/run_imagenet_train_damping_025.sh
 ```
 
+Frequency-channel dropout remains disabled by default. Enable it with a
+default drop probability of `0.4` and four stochastic EOT members as follows:
+
+```bash
+LAYER1_DROPOUT_MODE=frequency_channel GENERATOR_MODE=legacy OUT_ROOT=/app/output/sharpit1 bash scripts/run_imagenet_train_damping_025.sh
+```
+
+The launcher also accepts `LAYER1_DROPOUT_P`,
+`LAYER1_DROPOUT_CHANNEL_RATIO`, `LAYER1_DROPOUT_HF_RATIO`,
+`LAYER1_DROPOUT_EOT_SAMPLES`, and `LAYER1_DROPOUT_EOT_REDUCTION` overrides.
+
 Training checkpoints are mode-specific. Continuation rejects a checkpoint if
 its generator mode differs from the requested mode. Legacy training
 checkpoints created while the gradient encoder was frozen cannot be resumed,

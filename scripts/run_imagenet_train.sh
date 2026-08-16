@@ -23,11 +23,33 @@ generator_mode="${GENERATOR_MODE:-isolated}"
 train_epochs="${TRAIN_EPOCHS:-15}"
 max_batches_per_epoch="${MAX_BATCHES_PER_EPOCH:-0}"
 ddsc_ema_decay="${DDSC_EMA_DECAY:-0.0}"
+layer1_dropout_mode="${LAYER1_DROPOUT_MODE:-off}"
+layer1_dropout_p="${LAYER1_DROPOUT_P:-0.4}"
+layer1_dropout_channel_ratio="${LAYER1_DROPOUT_CHANNEL_RATIO:-0.3}"
+layer1_dropout_hf_ratio="${LAYER1_DROPOUT_HF_RATIO:-0.35}"
+layer1_dropout_eot_samples="${LAYER1_DROPOUT_EOT_SAMPLES:-4}"
+layer1_dropout_eot_reduction="${LAYER1_DROPOUT_EOT_REDUCTION:-logits}"
 
 case "$generator_mode" in
     isolated|legacy) ;;
     *)
         echo "GENERATOR_MODE must be isolated or legacy" >&2
+        exit 2
+        ;;
+esac
+
+case "$layer1_dropout_mode" in
+    off|frequency_channel) ;;
+    *)
+        echo "LAYER1_DROPOUT_MODE must be off or frequency_channel" >&2
+        exit 2
+        ;;
+esac
+
+case "$layer1_dropout_eot_reduction" in
+    logits|loss) ;;
+    *)
+        echo "LAYER1_DROPOUT_EOT_REDUCTION must be logits or loss" >&2
         exit 2
         ;;
 esac
@@ -107,6 +129,7 @@ resolve_imagenet_train_dir() {
 train_dir="$(resolve_imagenet_train_dir "${2:-}")"
 echo "imagenet_train_dir=$train_dir"
 echo "batch_size=16 epochs=$train_epochs max_batches_per_epoch=$max_batches_per_epoch warmup_epochs=2 damping=$damping ema_decay=$ddsc_ema_decay"
+echo "layer1_dropout_mode=$layer1_dropout_mode p=$layer1_dropout_p channel_ratio=$layer1_dropout_channel_ratio hf_ratio=$layer1_dropout_hf_ratio eot_samples=$layer1_dropout_eot_samples eot_reduction=$layer1_dropout_eot_reduction"
 
 export CUDA_VISIBLE_DEVICES="$gpu_id"
 export TORCH_HOME="${TORCH_HOME:-$root/.cache/torch}"
@@ -120,6 +143,12 @@ exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
     --train_dir "$train_dir" \
     --model_type res50 \
     --generator_mode "$generator_mode" \
+    --layer1_dropout_mode "$layer1_dropout_mode" \
+    --layer1_dropout_p "$layer1_dropout_p" \
+    --layer1_dropout_channel_ratio "$layer1_dropout_channel_ratio" \
+    --layer1_dropout_hf_ratio "$layer1_dropout_hf_ratio" \
+    --layer1_dropout_eot_samples "$layer1_dropout_eot_samples" \
+    --layer1_dropout_eot_reduction "$layer1_dropout_eot_reduction" \
     --eps 10 \
     --target -1 \
     --batch_size 16 \
