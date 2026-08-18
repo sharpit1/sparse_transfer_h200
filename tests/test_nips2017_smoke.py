@@ -80,6 +80,8 @@ class NIPS2017SmokeTests(unittest.TestCase):
         self.assertIn("--batch_size 16", common)
         self.assertIn("--epochs 5", common)
         self.assertIn("--ddsc_warmup_epochs 2", common)
+        self.assertIn("isolated|isolated_split|frozen_legacy|legacy", common)
+        self.assertIn('adapter_feature_guidance="${ADAPTER_FEATURE_GUIDANCE:-0}"', common)
         self.assertIn("/app/output/nips2017_smoke", common)
         self.assertIn("0.25", damping_025)
         self.assertIn("0.5", damping_050)
@@ -145,6 +147,8 @@ class NIPS2017SmokeTests(unittest.TestCase):
         self.assertIn("1000", common)
         self.assertIn("/app/data/ImageNet-2012/train", common)
         self.assertIn("/app/output/sharpit1", common)
+        self.assertIn("isolated|isolated_split|frozen_legacy|legacy", common)
+        self.assertIn('adapter_feature_guidance="${ADAPTER_FEATURE_GUIDANCE:-0}"', common)
         self.assertIn("0.25", damping_025)
         self.assertIn("0.5", damping_050)
 

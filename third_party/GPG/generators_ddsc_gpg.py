@@ -1,12 +1,14 @@
-"""Isolated parameter-reduced generator for DDSC-GPG training.
+"""Adapter-based parameter-reduced generators for DDSC-GPG training.
 
 The generator keeps GPG's perturbation and stochastic soft/hard mask outputs,
 but replaces both learned image encoders with a frozen ImageNet ResNet-50 V1
-prefix (conv1 -> bn1 -> relu -> maxpool -> layer1) and a shared-lite decoder.
+prefix (conv1 -> bn1 -> relu -> maxpool -> layer1).  The shared variant uses
+one upsampling trunk for perturbation and mask heads; the split variant keeps
+the adapter and residual body shared but learns one upsampling trunk per head.
 
-The legacy feature-alignment loss is intentionally not implemented.  Once the
-encoder is frozen, a distance between clean and PGD-image encoder features is
-constant with respect to the decoder and therefore cannot train it.  The GPG
+Optional adapter feature guidance mirrors the original GPG training contract
+at the trainable interface: compare the clean adapter output with a separate
+trainable PGD-image adapter output before the residual body.  The existing GPG
 pixel-space PGD guidance loss remains in ``DDSC_GPG_train.py``.
 """
 
@@ -24,6 +26,7 @@ import torch.nn as nn
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 GENERATOR_TYPE = "ddsc_gpg_resnet50_layer1_shared_lite_v1"
+SPLIT_GENERATOR_TYPE = "ddsc_gpg_resnet50_layer1_split_lite_v1"
 
 
 def module_state_sha256(module: nn.Module) -> str:
@@ -119,6 +122,51 @@ class DepthwiseResidualBlock(nn.Module):
         return feature + self.block(feature)
 
 
+def _make_adapter(input_channels: int, width: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(input_channels, width, kernel_size=1, bias=False),
+        nn.BatchNorm2d(width),
+        nn.ReLU(inplace=True),
+    )
+
+
+def _make_upsample_block(
+    input_channels: int,
+    output_channels: int,
+    upsample_backend: str,
+) -> nn.Sequential:
+    if upsample_backend == "nearest_conv":
+        modules: tuple[nn.Module, ...] = (
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(
+                input_channels,
+                output_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+        )
+    elif upsample_backend == "transpose":
+        modules = (
+            nn.ConvTranspose2d(
+                input_channels,
+                output_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=1,
+                bias=False,
+            ),
+        )
+    else:  # pragma: no cover - callers validate the public option first
+        raise ValueError("unsupported upsample backend")
+    return nn.Sequential(
+        *modules,
+        nn.BatchNorm2d(output_channels),
+        nn.ReLU(inplace=True),
+    )
+
+
 class SharedLiteGPGDecoder(nn.Module):
     """Decode a 256-channel ResNet layer1 feature into GPG's two heads."""
 
@@ -147,67 +195,15 @@ class SharedLiteGPGDecoder(nn.Module):
         output_channels = max(1, width // 4)
         self.trunk_channels = (self.width, middle_channels, output_channels)
 
-        self.adapter = nn.Sequential(
-            nn.Conv2d(input_channels, width, kernel_size=1, bias=False),
-            nn.BatchNorm2d(width),
-            nn.ReLU(inplace=True),
-        )
+        self.adapter = _make_adapter(input_channels, width)
         self.resblocks = nn.Sequential(
             *(DepthwiseResidualBlock(width) for _ in range(num_blocks))
         )
-        if upsample_backend == "nearest_conv":
-            upsample1: tuple[nn.Module, ...] = (
-                nn.Upsample(scale_factor=2, mode="nearest"),
-                nn.Conv2d(
-                    width,
-                    middle_channels,
-                    kernel_size=3,
-                    padding=1,
-                    bias=False,
-                ),
-            )
-            upsample2: tuple[nn.Module, ...] = (
-                nn.Upsample(scale_factor=2, mode="nearest"),
-                nn.Conv2d(
-                    middle_channels,
-                    output_channels,
-                    kernel_size=3,
-                    padding=1,
-                    bias=False,
-                ),
-            )
-        else:
-            upsample1 = (
-                nn.ConvTranspose2d(
-                    width,
-                    middle_channels,
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                    output_padding=1,
-                    bias=False,
-                ),
-            )
-            upsample2 = (
-                nn.ConvTranspose2d(
-                    middle_channels,
-                    output_channels,
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                    output_padding=1,
-                    bias=False,
-                ),
-            )
-        self.upsample1 = nn.Sequential(
-            *upsample1,
-            nn.BatchNorm2d(middle_channels),
-            nn.ReLU(inplace=True),
+        self.upsample1 = _make_upsample_block(
+            width, middle_channels, upsample_backend
         )
-        self.upsample2 = nn.Sequential(
-            *upsample2,
-            nn.BatchNorm2d(output_channels),
-            nn.ReLU(inplace=True),
+        self.upsample2 = _make_upsample_block(
+            middle_channels, output_channels, upsample_backend
         )
         self.perturbation_head = nn.Sequential(
             nn.ReflectionPad2d(3),
@@ -221,8 +217,12 @@ class SharedLiteGPGDecoder(nn.Module):
     def forward(
         self, encoder_feature: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        decoded = self.adapter(encoder_feature)
-        decoded = self.resblocks(decoded)
+        return self.forward_from_adapter(self.adapter(encoder_feature))
+
+    def forward_from_adapter(
+        self, adapter_feature: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        decoded = self.resblocks(adapter_feature)
         decoded = self.upsample1(decoded)
         decoded = self.upsample2(decoded)
         return self.perturbation_head(decoded), self.mask_head(decoded)
@@ -239,10 +239,92 @@ class SharedLiteGPGDecoder(nn.Module):
         }
 
 
+class SplitLiteGPGDecoder(nn.Module):
+    """Share the adapter/body and split both learnable upsampling stages."""
+
+    def __init__(
+        self,
+        *,
+        input_channels: int = 256,
+        width: int = 128,
+        num_blocks: int = 3,
+        upsample_backend: str = "transpose",
+    ) -> None:
+        super().__init__()
+        if input_channels <= 0 or width <= 0 or num_blocks < 0:
+            raise ValueError(
+                "input_channels/width must be positive and num_blocks non-negative"
+            )
+        if upsample_backend not in {"nearest_conv", "transpose"}:
+            raise ValueError(
+                "upsample_backend must be nearest_conv or transpose"
+            )
+        self.input_channels = int(input_channels)
+        self.width = int(width)
+        self.num_blocks = int(num_blocks)
+        self.upsample_backend = upsample_backend
+        middle_channels = max(1, width // 2)
+        output_channels = max(1, width // 4)
+        self.trunk_channels = (self.width, middle_channels, output_channels)
+
+        self.adapter = _make_adapter(input_channels, width)
+        self.resblocks = nn.Sequential(
+            *(DepthwiseResidualBlock(width) for _ in range(num_blocks))
+        )
+        self.perturbation_upsample1 = _make_upsample_block(
+            width, middle_channels, upsample_backend
+        )
+        self.perturbation_upsample2 = _make_upsample_block(
+            middle_channels, output_channels, upsample_backend
+        )
+        self.mask_upsample1 = _make_upsample_block(
+            width, middle_channels, upsample_backend
+        )
+        self.mask_upsample2 = _make_upsample_block(
+            middle_channels, output_channels, upsample_backend
+        )
+        self.perturbation_head = nn.Sequential(
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(output_channels, 3, kernel_size=7),
+        )
+        self.mask_head = nn.Sequential(
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(output_channels, 1, kernel_size=7),
+        )
+
+    def forward(
+        self, encoder_feature: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_from_adapter(self.adapter(encoder_feature))
+
+    def forward_from_adapter(
+        self, adapter_feature: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shared = self.resblocks(adapter_feature)
+        perturbation = self.perturbation_upsample1(shared)
+        perturbation = self.perturbation_upsample2(perturbation)
+        mask = self.mask_upsample1(shared)
+        mask = self.mask_upsample2(mask)
+        return self.perturbation_head(perturbation), self.mask_head(mask)
+
+    def architecture_metadata(self) -> dict[str, Any]:
+        return {
+            "variant": "split_lite",
+            "input_channels": self.input_channels,
+            "width": self.width,
+            "num_blocks": self.num_blocks,
+            "upsample_backend": self.upsample_backend,
+            "shared_upsample_trunk": False,
+            "split_point": "after_shared_residual_body",
+            "trunk_channels": list(self.trunk_channels),
+        }
+
+
 class DDSCGPGGenerator(nn.Module):
     """Frozen ResNet layer1 encoder plus a trainable GPG shared-lite decoder."""
 
     generator_type = GENERATOR_TYPE
+    decoder_class = SharedLiteGPGDecoder
 
     def __init__(
         self,
@@ -252,13 +334,20 @@ class DDSCGPGGenerator(nn.Module):
         decoder_width: int = 128,
         decoder_num_blocks: int = 3,
         decoder_upsample_backend: str = "transpose",
+        adapter_feature_guidance: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = FrozenResNet50Layer1(resnet50)
-        self.decoder = SharedLiteGPGDecoder(
+        self.decoder = self.decoder_class(
             width=decoder_width,
             num_blocks=decoder_num_blocks,
             upsample_backend=decoder_upsample_backend,
+        )
+        self.adapter_feature_guidance = bool(adapter_feature_guidance)
+        self.pgd_adapter = (
+            _make_adapter(self.decoder.input_channels, self.decoder.width)
+            if self.adapter_feature_guidance
+            else None
         )
         self.inception = bool(inception)
 
@@ -270,7 +359,7 @@ class DDSCGPGGenerator(nn.Module):
     def trainable_parameters(self) -> Iterator[nn.Parameter]:
         return (
             parameter
-            for parameter in self.decoder.parameters()
+            for parameter in self.parameters()
             if parameter.requires_grad
         )
 
@@ -278,16 +367,28 @@ class DDSCGPGGenerator(nn.Module):
         self,
         image: torch.Tensor,
         eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        grad_AE: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         if not torch.is_floating_point(image):
             raise TypeError("image must be floating point")
         perturb_budget = float(eps)
         if perturb_budget < 0.0:
             raise ValueError("eps must be non-negative")
+        if (
+            self.adapter_feature_guidance
+            and self.training
+            and grad_AE is None
+        ):
+            raise ValueError(
+                "adapter feature guidance requires grad_AE during training"
+            )
 
         with torch.no_grad():
             encoder_feature = self.encoder(image).detach()
-        perturbation_logits, mask_logits = self.decoder(encoder_feature)
+        clean_adapter_feature = self.decoder.adapter(encoder_feature)
+        perturbation_logits, mask_logits = self.decoder.forward_from_adapter(
+            clean_adapter_feature
+        )
 
         # ResNet layer1 is 1/4 scale.  A 299x299 image yields 75x75 features
         # and therefore a 300x300 decode.  Match GPG's ConstantPad2d
@@ -322,10 +423,24 @@ class DDSCGPGGenerator(nn.Module):
         else:
             adv_0 = hard_mask.detach()
         adv = torch.clamp(image + adv_inf * adv_0, min=0.0, max=1.0)
-        return adv, adv_inf, adv_0, adv_00
+        outputs: tuple[torch.Tensor, ...] = (adv, adv_inf, adv_0, adv_00)
+        if grad_AE is not None:
+            if not self.adapter_feature_guidance or self.pgd_adapter is None:
+                raise ValueError(
+                    "grad_AE requires adapter feature guidance to be enabled"
+                )
+            if grad_AE.shape != image.shape:
+                raise ValueError("grad_AE must have the same shape as image")
+            with torch.no_grad():
+                pgd_encoder_feature = self.encoder(grad_AE).detach()
+            pgd_adapter_feature = self.pgd_adapter(pgd_encoder_feature)
+            outputs += (
+                torch.norm(clean_adapter_feature - pgd_adapter_feature, p=2),
+            )
+        return outputs
 
     def architecture_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "generator_type": self.generator_type,
             "encoder": {
                 "architecture": "resnet50",
@@ -344,6 +459,23 @@ class DDSCGPGGenerator(nn.Module):
                 else "none"
             ),
         }
+        if self.adapter_feature_guidance:
+            metadata["adapter_feature_guidance"] = {
+                "enabled": True,
+                "location": "post_adapter_pre_residual_body",
+                "pgd_branch": "separate_trainable_adapter",
+                "pgd_input": "image_plus_projected_pgd_delta",
+                "distance": "l2_norm",
+                "used_during_inference": False,
+            }
+        return metadata
+
+
+class DDSCSplitGPGGenerator(DDSCGPGGenerator):
+    """Frozen ResNet plus shared adapter/body and two decoder trunks."""
+
+    generator_type = SPLIT_GENERATOR_TYPE
+    decoder_class = SplitLiteGPGDecoder
 
 
 def parameter_count(module: nn.Module, *, trainable_only: bool = False) -> int:
@@ -358,12 +490,15 @@ def parameter_count(module: nn.Module, *, trainable_only: bool = False) -> int:
 
 __all__ = [
     "DDSCGPGGenerator",
+    "DDSCSplitGPGGenerator",
     "DepthwiseResidualBlock",
     "FrozenResNet50Layer1",
     "GENERATOR_TYPE",
     "IMAGENET_MEAN",
     "IMAGENET_STD",
     "SharedLiteGPGDecoder",
+    "SPLIT_GENERATOR_TYPE",
+    "SplitLiteGPGDecoder",
     "module_state_sha256",
     "parameter_count",
 ]
