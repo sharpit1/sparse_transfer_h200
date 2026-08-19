@@ -1,8 +1,11 @@
-"""Isolated parameter-reduced generator for DDSC-GPG training.
+"""Isolated parameter-reduced generators for DDSC-GPG training.
 
 The generator keeps GPG's perturbation and stochastic soft/hard mask outputs,
 but replaces both learned image encoders with a frozen ImageNet ResNet-50 V1
-prefix (conv1 -> bn1 -> relu -> maxpool -> layer1) and a shared-lite decoder.
+prefix (conv1 -> bn1 -> relu -> maxpool -> layer1).  The shared variant uses
+one upsampling trunk for both outputs; the split variant keeps the adapter and
+residual body shared but learns independent perturbation and mask upsampling
+trunks.
 
 The legacy feature-alignment loss is intentionally not implemented.  Once the
 encoder is frozen, a distance between clean and PGD-image encoder features is
@@ -24,6 +27,7 @@ import torch.nn as nn
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 GENERATOR_TYPE = "ddsc_gpg_resnet50_layer1_shared_lite_v1"
+SPLIT_GENERATOR_TYPE = "ddsc_gpg_resnet50_layer1_split_lite_v1"
 
 
 def module_state_sha256(module: nn.Module) -> str:
@@ -117,6 +121,51 @@ class DepthwiseResidualBlock(nn.Module):
 
     def forward(self, feature: torch.Tensor) -> torch.Tensor:
         return feature + self.block(feature)
+
+
+def _make_adapter(input_channels: int, width: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(input_channels, width, kernel_size=1, bias=False),
+        nn.BatchNorm2d(width),
+        nn.ReLU(inplace=True),
+    )
+
+
+def _make_upsample_block(
+    input_channels: int,
+    output_channels: int,
+    upsample_backend: str,
+) -> nn.Sequential:
+    if upsample_backend == "nearest_conv":
+        modules: tuple[nn.Module, ...] = (
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(
+                input_channels,
+                output_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+        )
+    elif upsample_backend == "transpose":
+        modules = (
+            nn.ConvTranspose2d(
+                input_channels,
+                output_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=1,
+                bias=False,
+            ),
+        )
+    else:  # pragma: no cover - public constructors validate this first
+        raise ValueError("unsupported upsample backend")
+    return nn.Sequential(
+        *modules,
+        nn.BatchNorm2d(output_channels),
+        nn.ReLU(inplace=True),
+    )
 
 
 class SharedLiteGPGDecoder(nn.Module):
@@ -239,10 +288,88 @@ class SharedLiteGPGDecoder(nn.Module):
         }
 
 
+class SplitLiteGPGDecoder(nn.Module):
+    """Share the adapter/body and split both learnable upsampling stages."""
+
+    def __init__(
+        self,
+        *,
+        input_channels: int = 256,
+        width: int = 128,
+        num_blocks: int = 3,
+        upsample_backend: str = "transpose",
+    ) -> None:
+        super().__init__()
+        if input_channels <= 0 or width <= 0 or num_blocks < 0:
+            raise ValueError(
+                "input_channels/width must be positive and num_blocks non-negative"
+            )
+        if upsample_backend not in {"nearest_conv", "transpose"}:
+            raise ValueError(
+                "upsample_backend must be nearest_conv or transpose"
+            )
+        self.input_channels = int(input_channels)
+        self.width = int(width)
+        self.num_blocks = int(num_blocks)
+        self.upsample_backend = upsample_backend
+        middle_channels = max(1, width // 2)
+        output_channels = max(1, width // 4)
+        self.trunk_channels = (self.width, middle_channels, output_channels)
+
+        self.adapter = _make_adapter(input_channels, width)
+        self.resblocks = nn.Sequential(
+            *(DepthwiseResidualBlock(width) for _ in range(num_blocks))
+        )
+        self.perturbation_upsample1 = _make_upsample_block(
+            width, middle_channels, upsample_backend
+        )
+        self.perturbation_upsample2 = _make_upsample_block(
+            middle_channels, output_channels, upsample_backend
+        )
+        self.mask_upsample1 = _make_upsample_block(
+            width, middle_channels, upsample_backend
+        )
+        self.mask_upsample2 = _make_upsample_block(
+            middle_channels, output_channels, upsample_backend
+        )
+        self.perturbation_head = nn.Sequential(
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(output_channels, 3, kernel_size=7),
+        )
+        self.mask_head = nn.Sequential(
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(output_channels, 1, kernel_size=7),
+        )
+
+    def forward(
+        self, encoder_feature: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shared = self.adapter(encoder_feature)
+        shared = self.resblocks(shared)
+        perturbation = self.perturbation_upsample1(shared)
+        perturbation = self.perturbation_upsample2(perturbation)
+        mask = self.mask_upsample1(shared)
+        mask = self.mask_upsample2(mask)
+        return self.perturbation_head(perturbation), self.mask_head(mask)
+
+    def architecture_metadata(self) -> dict[str, Any]:
+        return {
+            "variant": "split_lite",
+            "input_channels": self.input_channels,
+            "width": self.width,
+            "num_blocks": self.num_blocks,
+            "upsample_backend": self.upsample_backend,
+            "shared_upsample_trunk": False,
+            "split_point": "after_shared_residual_body",
+            "trunk_channels": list(self.trunk_channels),
+        }
+
+
 class DDSCGPGGenerator(nn.Module):
     """Frozen ResNet layer1 encoder plus a trainable GPG shared-lite decoder."""
 
     generator_type = GENERATOR_TYPE
+    decoder_class = SharedLiteGPGDecoder
 
     def __init__(
         self,
@@ -255,7 +382,7 @@ class DDSCGPGGenerator(nn.Module):
     ) -> None:
         super().__init__()
         self.encoder = FrozenResNet50Layer1(resnet50)
-        self.decoder = SharedLiteGPGDecoder(
+        self.decoder = self.decoder_class(
             width=decoder_width,
             num_blocks=decoder_num_blocks,
             upsample_backend=decoder_upsample_backend,
@@ -346,6 +473,13 @@ class DDSCGPGGenerator(nn.Module):
         }
 
 
+class DDSCSplitGPGGenerator(DDSCGPGGenerator):
+    """Frozen ResNet plus shared adapter/body and split output trunks."""
+
+    generator_type = SPLIT_GENERATOR_TYPE
+    decoder_class = SplitLiteGPGDecoder
+
+
 def parameter_count(module: nn.Module, *, trainable_only: bool = False) -> int:
     """Return a deterministic parameter count for logging and tests."""
 
@@ -358,12 +492,15 @@ def parameter_count(module: nn.Module, *, trainable_only: bool = False) -> int:
 
 __all__ = [
     "DDSCGPGGenerator",
+    "DDSCSplitGPGGenerator",
     "DepthwiseResidualBlock",
     "FrozenResNet50Layer1",
     "GENERATOR_TYPE",
     "IMAGENET_MEAN",
     "IMAGENET_STD",
     "SharedLiteGPGDecoder",
+    "SPLIT_GENERATOR_TYPE",
+    "SplitLiteGPGDecoder",
     "module_state_sha256",
     "parameter_count",
 ]

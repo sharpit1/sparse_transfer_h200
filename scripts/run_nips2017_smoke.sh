@@ -23,9 +23,9 @@ out_root="${OUT_ROOT:-/app/output/nips2017_smoke}"
 generator_mode="${GENERATOR_MODE:-isolated}"
 
 case "$generator_mode" in
-    isolated|legacy) ;;
+    isolated|isolated_split|legacy) ;;
     *)
-        echo "GENERATOR_MODE must be isolated or legacy" >&2
+        echo "GENERATOR_MODE must be isolated, isolated_split, or legacy" >&2
         exit 2
         ;;
 esac
