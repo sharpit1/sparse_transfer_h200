@@ -1,21 +1,26 @@
 # DDSC-GPG H200 smoke runs
 
-This repository packages the dual-mode DDSC-GPG trainer and a licensed
+This repository packages the three-mode DDSC-GPG trainer and a licensed
 16-image NIPS2017 subset for reproducible GPU smoke testing. Two launchers use
 the same data and optimization settings while changing only DDSC damping.
 
 ## Generator modes
 
 The trainer defaults to `isolated`, which uses the frozen ResNet-50 layer1
-encoder and shared-lite decoder. Select `legacy` to use the original learned
-dual-encoder GPG generator while retaining DDSC dynamic lambda-1, pixel-space
-PGD guidance, the original trainable feature-guidance loss, and the configured
-attack-objective Dropout-EOT behavior. In `legacy` mode, `Grad_block1` through
-`Grad_block3` are trainable and receive the feature-guidance gradient.
+encoder and shared-lite decoder. Select `isolated_split` to keep the same
+frozen encoder, adapter, and shared residual body while giving the perturbation
+and mask branches independent upsampling trunks. Select `legacy` to use the
+original learned dual-encoder GPG generator while retaining DDSC dynamic
+lambda-1, pixel-space PGD guidance, the original trainable feature-guidance
+loss, and the configured attack-objective Dropout-EOT behavior. In `legacy`
+mode, `Grad_block1` through `Grad_block3` are trainable and receive the
+feature-guidance gradient.
 
 The supplied launchers expose the selection through `GENERATOR_MODE`:
 
 ```bash
+GENERATOR_MODE=isolated_split bash scripts/run_nips2017_smoke_damping_025.sh
+GENERATOR_MODE=isolated_split bash scripts/run_imagenet_train_damping_025.sh
 GENERATOR_MODE=legacy bash scripts/run_nips2017_smoke_damping_025.sh
 GENERATOR_MODE=legacy bash scripts/run_imagenet_train_damping_025.sh
 ```

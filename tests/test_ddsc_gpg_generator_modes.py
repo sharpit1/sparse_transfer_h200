@@ -28,7 +28,12 @@ try:
         validate_optimizer_state_dict,
         validate_resume_metadata,
     )
-    from third_party.GPG.generators_ddsc_gpg import DDSCGPGGenerator
+    from third_party.GPG.generators_ddsc_gpg import (
+        DDSCGPGGenerator,
+        DDSCSplitGPGGenerator,
+        SPLIT_GENERATOR_TYPE,
+        parameter_count,
+    )
     from third_party.GPG.generators_legacy_gpg import (
         LEGACY_GENERATOR_TYPE,
         LegacyGPGGenerator,
@@ -60,6 +65,11 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
         parser = build_parser()
         self.assertEqual(parser.parse_args([]).generator_mode, "isolated")
         self.assertEqual(parser.parse_args([]).max_batches_per_epoch, 0)
+
+        split_args = parser.parse_args(
+            ["--generator_mode", "isolated_split"]
+        )
+        validate_args(split_args)
 
         legacy_args = parser.parse_args(["--generator_mode", "legacy"])
         validate_args(legacy_args)
@@ -107,9 +117,12 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
             },
         )
 
-    def test_both_modes_implement_the_ddsc_four_output_forward_contract(self) -> None:
+    def test_all_modes_implement_the_ddsc_four_output_forward_contract(self) -> None:
         generators = (
             DDSCGPGGenerator(torchvision.models.resnet50(weights=None)),
+            DDSCSplitGPGGenerator(
+                torchvision.models.resnet50(weights=None)
+            ),
             LegacyGPGGenerator(),
         )
         image = torch.rand(1, 3, 32, 32)
@@ -122,9 +135,171 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
                 self.assertEqual(tuple(adv_0.shape), (1, 1, 32, 32))
                 self.assertEqual(tuple(adv_00.shape), (1, 1, 32, 32))
 
-    def test_inference_checkpoint_round_trip_supports_both_modes(self) -> None:
+    def test_isolated_split_duplicates_only_the_upsampling_trunk(self) -> None:
+        shared_generator = DDSCGPGGenerator(
+            torchvision.models.resnet50(weights=None)
+        )
+        generator = DDSCSplitGPGGenerator(
+            torchvision.models.resnet50(weights=None)
+        )
+
+        self.assertEqual(parameter_count(shared_generator.decoder), 185_796)
+        self.assertEqual(len(shared_generator.state_dict()), 126)
+        self.assertEqual(generator.generator_type, SPLIT_GENERATOR_TYPE)
+        self.assertEqual(parameter_count(generator.decoder), 278_148)
+        self.assertEqual(
+            parameter_count(generator, trainable_only=True),
+            278_148,
+        )
+        metadata = generator.decoder.architecture_metadata()
+        self.assertEqual(metadata["variant"], "split_lite")
+        self.assertEqual(
+            metadata["split_point"],
+            "after_shared_residual_body",
+        )
+        self.assertFalse(metadata["shared_upsample_trunk"])
+        self.assertIsNot(
+            generator.decoder.perturbation_upsample1,
+            generator.decoder.mask_upsample1,
+        )
+        self.assertIsNot(
+            generator.decoder.perturbation_upsample2,
+            generator.decoder.mask_upsample2,
+        )
+
+    def test_isolated_split_routes_branch_gradients_independently(self) -> None:
+        generator = DDSCSplitGPGGenerator(
+            torchvision.models.resnet50(weights=None)
+        ).train()
+        image = torch.rand(1, 3, 32, 32)
+
+        _, adv_inf, _, _ = generator(image, 10 / 255.0)
+        adv_inf.mean().backward()
+        self.assertTrue(
+            all(
+                parameter.grad is not None
+                for parameter in generator.decoder.perturbation_upsample1.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for parameter in generator.decoder.mask_upsample1.parameters()
+            )
+        )
+
+        generator.zero_grad(set_to_none=True)
+        _, _, _, soft_mask = generator(image, 10 / 255.0)
+        soft_mask.mean().backward()
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for parameter in generator.decoder.perturbation_upsample1.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is not None
+                for parameter in generator.decoder.mask_upsample1.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is not None
+                for parameter in generator.decoder.adapter.parameters()
+            )
+        )
+
+    def test_isolated_split_nearest_conv_training_checkpoint_round_trip(
+        self,
+    ) -> None:
+        generator = DDSCSplitGPGGenerator(
+            torchvision.models.resnet50(weights=None),
+            decoder_width=8,
+            decoder_num_blocks=0,
+            decoder_upsample_backend="nearest_conv",
+        ).train()
+        learning_rate = 2.25e-5
+        optimizer = torch.optim.Adam(
+            list(generator.trainable_parameters()),
+            lr=learning_rate,
+            betas=(0.5, 0.999),
+        )
+        image = torch.rand(1, 3, 32, 32)
+        adv, adv_inf, applied_mask, continuous_mask = generator(
+            image,
+            10 / 255.0,
+        )
+        self.assertEqual(tuple(adv.shape), (1, 3, 32, 32))
+        self.assertEqual(tuple(adv_inf.shape), tuple(adv.shape))
+        self.assertEqual(tuple(applied_mask.shape), (1, 1, 32, 32))
+        self.assertEqual(tuple(continuous_mask.shape), tuple(applied_mask.shape))
+        (adv.mean() + adv_inf.square().mean() + continuous_mask.mean()).backward()
+        optimizer.step()
+
+        args = build_parser().parse_args(
+            [
+                "--generator_mode",
+                "isolated_split",
+                "--device",
+                "cpu",
+                "--epochs",
+                "2",
+                "--max_batches_per_epoch",
+                "1",
+                "--decoder_width",
+                "8",
+                "--decoder_num_blocks",
+                "0",
+                "--decoder_upsample_backend",
+                "nearest_conv",
+            ]
+        )
+        controller_config = controller_config_from_args(args)
+        attack_model_manifest = {
+            "schema": 1,
+            "model_type": "res50",
+            "architecture": "resnet50",
+            "weights_enum": "IMAGENET1K_V1",
+            "state_sha256": "0" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            inference_path, training_path = save_epoch_checkpoints(
+                output_path=Path(directory),
+                epoch=0,
+                net_g=generator,
+                optimizer=optimizer,
+                controller_config=controller_config,
+                controller_state=initial_controller_state(controller_config),
+                args=args,
+                data_loader_generator=torch.Generator().manual_seed(0),
+                attack_model_manifest=attack_model_manifest,
+                dataset_manifest={"sample_count": 1},
+                runtime_manifest=runtime_contract(torch.device("cpu")),
+            )
+
+            training_payload = load_training_checkpoint(training_path)
+            validate_resume_metadata(training_payload, args, controller_config)
+            restored, inference_payload = (
+                build_generator_from_inference_checkpoint(inference_path)
+            )
+
+        self.assertEqual(restored.generator_type, SPLIT_GENERATOR_TYPE)
+        self.assertEqual(
+            inference_payload["architecture"],
+            generator.architecture_metadata(),
+        )
+        self.assertEqual(
+            restored.decoder.upsample_backend,
+            "nearest_conv",
+        )
+
+    def test_inference_checkpoint_round_trip_supports_all_modes(self) -> None:
         generators = (
             DDSCGPGGenerator(torchvision.models.resnet50(weights=None)),
+            DDSCSplitGPGGenerator(
+                torchvision.models.resnet50(weights=None)
+            ),
             LegacyGPGGenerator(eps=10 / 255.0),
         )
         with tempfile.TemporaryDirectory() as directory:

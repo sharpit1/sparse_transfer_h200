@@ -31,9 +31,9 @@ layer1_dropout_eot_samples="${LAYER1_DROPOUT_EOT_SAMPLES:-4}"
 layer1_dropout_eot_reduction="${LAYER1_DROPOUT_EOT_REDUCTION:-logits}"
 
 case "$generator_mode" in
-    isolated|legacy) ;;
+    isolated|isolated_split|legacy) ;;
     *)
-        echo "GENERATOR_MODE must be isolated or legacy" >&2
+        echo "GENERATOR_MODE must be isolated, isolated_split, or legacy" >&2
         exit 2
         ;;
 esac
