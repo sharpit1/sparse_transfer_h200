@@ -22,6 +22,7 @@ out_root="${OUT_ROOT:-/app/output/sharpit1}"
 generator_mode="${GENERATOR_MODE:-isolated}"
 train_epochs="${TRAIN_EPOCHS:-15}"
 max_batches_per_epoch="${MAX_BATCHES_PER_EPOCH:-0}"
+ddsc_warmup_epochs="${DDSC_WARMUP_EPOCHS:-2}"
 ddsc_ema_decay="${DDSC_EMA_DECAY:-0.0}"
 layer1_dropout_mode="${LAYER1_DROPOUT_MODE:-off}"
 layer1_dropout_p="${LAYER1_DROPOUT_P:-0.4}"
@@ -60,6 +61,10 @@ if [[ ! "$train_epochs" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "$max_batches_per_epoch" =~ ^[0-9]+$ ]]; then
     echo "MAX_BATCHES_PER_EPOCH must be a non-negative integer" >&2
+    exit 2
+fi
+if [[ ! "$ddsc_warmup_epochs" =~ ^[0-9]+$ ]]; then
+    echo "DDSC_WARMUP_EPOCHS must be a non-negative integer" >&2
     exit 2
 fi
 
@@ -128,7 +133,7 @@ resolve_imagenet_train_dir() {
 
 train_dir="$(resolve_imagenet_train_dir "${2:-}")"
 echo "imagenet_train_dir=$train_dir"
-echo "batch_size=16 epochs=$train_epochs max_batches_per_epoch=$max_batches_per_epoch warmup_epochs=2 damping=$damping ema_decay=$ddsc_ema_decay"
+echo "batch_size=16 epochs=$train_epochs max_batches_per_epoch=$max_batches_per_epoch warmup_epochs=$ddsc_warmup_epochs damping=$damping ema_decay=$ddsc_ema_decay"
 echo "layer1_dropout_mode=$layer1_dropout_mode p=$layer1_dropout_p channel_ratio=$layer1_dropout_channel_ratio hf_ratio=$layer1_dropout_hf_ratio eot_samples=$layer1_dropout_eot_samples eot_reduction=$layer1_dropout_eot_reduction"
 
 export CUDA_VISIBLE_DEVICES="$gpu_id"
@@ -172,7 +177,7 @@ exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
     --decoder_upsample_backend transpose \
     --save_every 1 \
     --ddsc_target_density 0.10 \
-    --ddsc_warmup_epochs 2 \
+    --ddsc_warmup_epochs "$ddsc_warmup_epochs" \
     --ddsc_ema_decay "$ddsc_ema_decay" \
     --ddsc_mass 1.0 \
     --ddsc_damping "$damping" \

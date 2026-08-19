@@ -53,6 +53,14 @@ LAYER1_DROPOUT_MODE=frequency_channel GENERATOR_MODE=legacy OUT_ROOT=/app/output
 The launcher also accepts `LAYER1_DROPOUT_P`,
 `LAYER1_DROPOUT_CHANNEL_RATIO`, `LAYER1_DROPOUT_HF_RATIO`,
 `LAYER1_DROPOUT_EOT_SAMPLES`, and `LAYER1_DROPOUT_EOT_REDUCTION` overrides.
+`LAYER1_DROPOUT_CHANNEL_RATIO` controls the fraction of layer1 channels with
+the highest high-frequency energy that are eligible for dropout. The ImageNet
+launcher also accepts `DDSC_WARMUP_EPOCHS` as a non-negative integer. For
+example, use three warm-up epochs and make the top 50% of channels eligible:
+
+```bash
+DDSC_WARMUP_EPOCHS=3 LAYER1_DROPOUT_MODE=frequency_channel LAYER1_DROPOUT_CHANNEL_RATIO=0.5 GENERATOR_MODE=isolated_split OUT_ROOT=/app/output/sharpit1 bash scripts/run_imagenet_train_damping_025.sh
+```
 
 Training checkpoints are mode-specific. Continuation rejects a checkpoint if
 its generator mode differs from the requested mode. Legacy training

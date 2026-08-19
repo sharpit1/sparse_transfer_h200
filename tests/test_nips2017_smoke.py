@@ -99,6 +99,10 @@ class NIPS2017SmokeTests(unittest.TestCase):
         self.assertIn("--batch_size 16", common)
         self.assertIn('train_epochs="${TRAIN_EPOCHS:-15}"', common)
         self.assertIn('max_batches_per_epoch="${MAX_BATCHES_PER_EPOCH:-0}"', common)
+        self.assertIn(
+            'ddsc_warmup_epochs="${DDSC_WARMUP_EPOCHS:-2}"',
+            common,
+        )
         self.assertIn('ddsc_ema_decay="${DDSC_EMA_DECAY:-0.0}"', common)
         self.assertIn('--ddsc_ema_decay "$ddsc_ema_decay"', common)
         self.assertIn(
@@ -140,7 +144,14 @@ class NIPS2017SmokeTests(unittest.TestCase):
             '--layer1_dropout_eot_reduction "$layer1_dropout_eot_reduction"',
             common,
         )
-        self.assertIn("--ddsc_warmup_epochs 2", common)
+        self.assertIn(
+            'if [[ ! "$ddsc_warmup_epochs" =~ ^[0-9]+$ ]]',
+            common,
+        )
+        self.assertIn(
+            '--ddsc_warmup_epochs "$ddsc_warmup_epochs"',
+            common,
+        )
         self.assertIn("--num_workers 8", common)
         self.assertNotIn("--train_csv", common)
         self.assertIn("1000", common)
