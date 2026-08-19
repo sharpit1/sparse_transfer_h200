@@ -14,7 +14,6 @@ try:
         CHECKPOINT_FORMAT,
         INFERENCE_CHECKPOINT_FORMAT,
         ISOLATED_DECODER_DEFAULTS,
-        PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
         build_generator_from_inference_checkpoint,
         build_parser,
         controller_config_from_args,
@@ -29,18 +28,10 @@ try:
         validate_optimizer_state_dict,
         validate_resume_metadata,
     )
-    from third_party.GPG.generators_ddsc_gpg import (
-        DDSCGPGGenerator,
-        DDSCSplitGPGGenerator,
-        SPLIT_GENERATOR_TYPE,
-    )
+    from third_party.GPG.generators_ddsc_gpg import DDSCGPGGenerator
     from third_party.GPG.generators_legacy_gpg import (
         LEGACY_GENERATOR_TYPE,
         LegacyGPGGenerator,
-    )
-    from third_party.GPG.generators_frozen_legacy_gpg import (
-        FROZEN_LEGACY_GENERATOR_TYPE,
-        FrozenResNetLegacyGPGGenerator,
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - optional local runtime
     torch = None
@@ -63,99 +54,18 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
         self.assertIn("upsampl_inf1.0.weight", generator.state_dict())
         self.assertIn("upsampl_01.0.weight", generator.state_dict())
 
-    def test_frozen_legacy_changes_only_the_encoder_interface(self) -> None:
-        backbone = torchvision.models.resnet50(weights=None)
-        generator = FrozenResNetLegacyGPGGenerator(backbone)
-        legacy = LegacyGPGGenerator()
-
-        self.assertEqual(
-            generator.generator_type,
-            FROZEN_LEGACY_GENERATOR_TYPE,
-        )
-        self.assertEqual(
-            sum(p.numel() for p in generator.parameters()),
-            8_059_972,
-        )
-        self.assertEqual(
-            sum(p.numel() for p in generator.parameters() if p.requires_grad),
-            7_834_628,
-        )
-        self.assertTrue(
-            all(not p.requires_grad for p in generator.encoder.parameters())
-        )
-        self.assertFalse(
-            any("adapter" in name for name, _ in generator.named_modules())
-        )
-        self.assertFalse(
-            any(
-                name.startswith("block1")
-                for name, _ in generator.named_parameters()
-            )
-        )
-        self.assertFalse(
-            any(
-                name.startswith("Grad_block")
-                for name, _ in generator.named_parameters()
-            )
-        )
-
-        legacy_back_end_prefixes = ("resblock", "upsampl", "blockf")
-        frozen_back_end = {
-            name: tuple(tensor.shape)
-            for name, tensor in generator.state_dict().items()
-            if name.startswith(legacy_back_end_prefixes)
-        }
-        legacy_back_end = {
-            name: tuple(tensor.shape)
-            for name, tensor in legacy.state_dict().items()
-            if name.startswith(legacy_back_end_prefixes)
-        }
-        self.assertEqual(frozen_back_end, legacy_back_end)
-        self.assertEqual(
-            generator.architecture_metadata()["encoder"]["adapter"],
-            "none",
-        )
-        self.assertEqual(
-            generator.architecture_metadata()["decoder"]["residual_blocks"],
-            6,
-        )
-
     def test_cli_selects_generator_mode_and_rejects_ignored_decoder_knobs(
         self,
     ) -> None:
         parser = build_parser()
         self.assertEqual(parser.parse_args([]).generator_mode, "isolated")
-        self.assertFalse(parser.parse_args([]).adapter_feature_guidance)
         self.assertEqual(parser.parse_args([]).max_batches_per_epoch, 0)
-
-        split_args = parser.parse_args(
-            [
-                "--generator_mode",
-                "isolated_split",
-                "--adapter_feature_guidance",
-            ]
-        )
-        validate_args(split_args)
 
         legacy_args = parser.parse_args(["--generator_mode", "legacy"])
         validate_args(legacy_args)
         legacy_args.decoder_width = ISOLATED_DECODER_DEFAULTS["decoder_width"] + 1
         with self.assertRaisesRegex(ValueError, "configure only the isolated"):
             validate_args(legacy_args)
-
-        legacy_guidance_args = parser.parse_args(
-            ["--generator_mode", "legacy", "--adapter_feature_guidance"]
-        )
-        with self.assertRaisesRegex(ValueError, "requires isolated"):
-            validate_args(legacy_guidance_args)
-
-        frozen_legacy_args = parser.parse_args(
-            ["--generator_mode", "frozen_legacy"]
-        )
-        validate_args(frozen_legacy_args)
-        frozen_legacy_args.decoder_num_blocks += 1
-        with self.assertRaisesRegex(ValueError, "configure only the isolated"):
-            validate_args(frozen_legacy_args)
 
         invalid_batch_limit_args = parser.parse_args(
             ["--max_batches_per_epoch", "-1"]
@@ -197,15 +107,9 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
             },
         )
 
-    def test_all_modes_implement_the_ddsc_four_output_forward_contract(self) -> None:
+    def test_both_modes_implement_the_ddsc_four_output_forward_contract(self) -> None:
         generators = (
             DDSCGPGGenerator(torchvision.models.resnet50(weights=None)),
-            DDSCSplitGPGGenerator(
-                torchvision.models.resnet50(weights=None)
-            ),
-            FrozenResNetLegacyGPGGenerator(
-                torchvision.models.resnet50(weights=None)
-            ),
             LegacyGPGGenerator(),
         )
         image = torch.rand(1, 3, 32, 32)
@@ -218,226 +122,9 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
                 self.assertEqual(tuple(adv_0.shape), (1, 1, 32, 32))
                 self.assertEqual(tuple(adv_00.shape), (1, 1, 32, 32))
 
-    def test_isolated_split_duplicates_only_the_upsampling_trunk(self) -> None:
-        generator = DDSCSplitGPGGenerator(
-            torchvision.models.resnet50(weights=None)
-        )
-
-        self.assertEqual(generator.generator_type, SPLIT_GENERATOR_TYPE)
-        self.assertEqual(
-            sum(p.numel() for p in generator.parameters() if p.requires_grad),
-            278_148,
-        )
-        self.assertFalse(
-            generator.decoder.architecture_metadata()["shared_upsample_trunk"]
-        )
-        perturbation_parameter = next(
-            generator.decoder.perturbation_upsample1.parameters()
-        )
-        mask_parameter = next(generator.decoder.mask_upsample1.parameters())
-        self.assertNotEqual(
-            perturbation_parameter.untyped_storage().data_ptr(),
-            mask_parameter.untyped_storage().data_ptr(),
-        )
-        self.assertIsNot(
-            generator.decoder.perturbation_upsample1,
-            generator.decoder.mask_upsample1,
-        )
-
-    def test_adapter_feature_guidance_trains_both_adapters(self) -> None:
-        for generator_class, expected_parameters in (
-            (DDSCGPGGenerator, 218_820),
-            (DDSCSplitGPGGenerator, 311_172),
-        ):
-            generator = generator_class(
-                torchvision.models.resnet50(weights=None),
-                adapter_feature_guidance=True,
-            )
-            image = torch.rand(1, 3, 32, 32)
-            pgd_image = torch.rand_like(image)
-
-            with self.subTest(generator_type=generator.generator_type):
-                with self.assertRaisesRegex(ValueError, "requires grad_AE"):
-                    generator(image, 10 / 255.0)
-                outputs = generator(image, 10 / 255.0, pgd_image)
-                self.assertEqual(len(outputs), 5)
-                feature_guidance = outputs[-1]
-                feature_guidance.backward()
-                self.assertEqual(
-                    sum(
-                        p.numel()
-                        for p in generator.parameters()
-                        if p.requires_grad
-                    ),
-                    expected_parameters,
-                )
-                self.assertTrue(
-                    all(
-                        parameter.grad is not None
-                        for parameter in generator.decoder.adapter.parameters()
-                    )
-                )
-                self.assertIsNotNone(generator.pgd_adapter)
-                self.assertTrue(
-                    all(
-                        parameter.grad is not None
-                        for parameter in generator.pgd_adapter.parameters()
-                    )
-                )
-                self.assertTrue(
-                    all(
-                        parameter.grad is None
-                        for parameter in generator.encoder.parameters()
-                    )
-                )
-                self.assertEqual(
-                    generator.architecture_metadata()[
-                        "adapter_feature_guidance"
-                    ]["location"],
-                    "post_adapter_pre_residual_body",
-                )
-
-    def test_isolated_split_routes_branch_gradients_independently(self) -> None:
-        generator = DDSCSplitGPGGenerator(
-            torchvision.models.resnet50(weights=None)
-        )
-        generator.train()
-        image = torch.rand(1, 3, 32, 32)
-
-        _, adv_inf, _, _ = generator(image, 10 / 255.0)
-        adv_inf.mean().backward()
-        self.assertTrue(
-            all(
-                parameter.grad is not None
-                for parameter in generator.decoder.perturbation_upsample1.parameters()
-            )
-        )
-        self.assertTrue(
-            all(
-                parameter.grad is None
-                for parameter in generator.decoder.mask_upsample1.parameters()
-            )
-        )
-
-        generator.zero_grad(set_to_none=True)
-        _, _, _, adv_00 = generator(image, 10 / 255.0)
-        adv_00.mean().backward()
-        self.assertTrue(
-            all(
-                parameter.grad is None
-                for parameter in generator.decoder.perturbation_upsample1.parameters()
-            )
-        )
-        self.assertTrue(
-            all(
-                parameter.grad is not None
-                for parameter in generator.decoder.mask_upsample1.parameters()
-            )
-        )
-        self.assertTrue(
-            all(
-                parameter.grad is not None
-                for parameter in generator.decoder.adapter.parameters()
-            )
-        )
-
-    def test_split_adapter_guidance_training_checkpoint_round_trip(self) -> None:
-        generator = DDSCSplitGPGGenerator(
-            torchvision.models.resnet50(weights=None),
-            adapter_feature_guidance=True,
-        )
-        learning_rate = 2.25e-5
-        optimizer = torch.optim.Adam(
-            list(generator.trainable_parameters()),
-            lr=learning_rate,
-            betas=(0.5, 0.999),
-        )
-        image = torch.rand(1, 3, 32, 32)
-        pgd_image = torch.rand_like(image)
-        adv, adv_inf, _, adv_00, feature_guidance = generator(
-            image,
-            10 / 255.0,
-            pgd_image,
-        )
-        (
-            adv.mean()
-            + adv_inf.square().mean()
-            + adv_00.mean()
-            + feature_guidance
-        ).backward()
-        optimizer.step()
-
-        args = build_parser().parse_args(
-            [
-                "--generator_mode",
-                "isolated_split",
-                "--adapter_feature_guidance",
-                "--device",
-                "cpu",
-                "--epochs",
-                "2",
-                "--max_batches_per_epoch",
-                "1",
-            ]
-        )
-        controller_config = controller_config_from_args(args)
-        attack_model_manifest = {
-            "schema": 1,
-            "model_type": "res50",
-            "architecture": "resnet50",
-            "weights_enum": "IMAGENET1K_V1",
-            "state_sha256": "0" * 64,
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            inference_path, training_path = save_epoch_checkpoints(
-                output_path=Path(directory),
-                epoch=0,
-                net_g=generator,
-                optimizer=optimizer,
-                controller_config=controller_config,
-                controller_state=initial_controller_state(controller_config),
-                args=args,
-                data_loader_generator=torch.Generator().manual_seed(0),
-                attack_model_manifest=attack_model_manifest,
-                dataset_manifest={"sample_count": 17},
-                runtime_manifest=runtime_contract(torch.device("cpu")),
-            )
-
-            training_payload = load_training_checkpoint(training_path)
-            validate_resume_metadata(training_payload, args, controller_config)
-            restored, inference_payload = (
-                build_generator_from_inference_checkpoint(inference_path)
-            )
-
-        self.assertEqual(restored.generator_type, SPLIT_GENERATOR_TYPE)
-        self.assertTrue(restored.adapter_feature_guidance)
-        with torch.no_grad():
-            self.assertEqual(
-                len(restored(torch.rand(1, 3, 32, 32), 10 / 255.0)),
-                4,
-            )
-        self.assertEqual(
-            inference_payload["architecture"],
-            generator.architecture_metadata(),
-        )
-
-    def test_inference_checkpoint_round_trip_supports_all_modes(self) -> None:
+    def test_inference_checkpoint_round_trip_supports_both_modes(self) -> None:
         generators = (
             DDSCGPGGenerator(torchvision.models.resnet50(weights=None)),
-            DDSCGPGGenerator(
-                torchvision.models.resnet50(weights=None),
-                adapter_feature_guidance=True,
-            ),
-            DDSCSplitGPGGenerator(
-                torchvision.models.resnet50(weights=None)
-            ),
-            DDSCSplitGPGGenerator(
-                torchvision.models.resnet50(weights=None),
-                adapter_feature_guidance=True,
-            ),
-            FrozenResNetLegacyGPGGenerator(
-                torchvision.models.resnet50(weights=None)
-            ),
             LegacyGPGGenerator(eps=10 / 255.0),
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -473,9 +160,7 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
                         loaded["architecture"],
                     )
 
-    def test_historical_frozen_gradient_legacy_inference_checkpoint_remains_readable(
-        self,
-    ) -> None:
+    def test_frozen_legacy_inference_checkpoint_remains_readable(self) -> None:
         generator = LegacyGPGGenerator(eps=10 / 255.0)
         architecture = copy.deepcopy(generator.architecture_metadata())
         architecture["encoder"]["gradient_branch"] = {
@@ -520,9 +205,7 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
         self.assertEqual(list(restored.state_dict()), list(generator.state_dict()))
         self.assertEqual(loaded["architecture"], architecture)
 
-    def test_historical_frozen_gradient_legacy_training_checkpoint_requires_restart(
-        self,
-    ) -> None:
+    def test_frozen_legacy_training_checkpoint_requires_restart(self) -> None:
         generator = LegacyGPGGenerator()
         architecture = copy.deepcopy(generator.architecture_metadata())
         architecture["encoder"]["gradient_branch"] = {
@@ -650,23 +333,6 @@ class DDSCGPGGeneratorModeTests(unittest.TestCase):
 
             training_payload = load_training_checkpoint(training_path)
             validate_resume_metadata(training_payload, args, controller_config)
-            checkpoint_format, previous_payload = torch.load(
-                training_path,
-                map_location="cpu",
-                weights_only=True,
-            )
-            self.assertEqual(checkpoint_format, CHECKPOINT_FORMAT)
-            previous_payload = copy.deepcopy(previous_payload)
-            previous_payload["train_args"].pop("adapter_feature_guidance")
-            previous_path = Path(directory) / "previous_v8.train.pth"
-            torch.save(
-                (PREVIOUS_TRAINING_CHECKPOINT_FORMAT, previous_payload),
-                previous_path,
-            )
-            normalized_previous = load_training_checkpoint(previous_path)
-            self.assertFalse(
-                normalized_previous["train_args"]["adapter_feature_guidance"]
-            )
             restored, inference_payload = (
                 build_generator_from_inference_checkpoint(inference_path)
             )

@@ -21,31 +21,14 @@ gpu_id="${GPU_ID:-0}"
 data_root="$root/data/nips2017_smoke"
 out_root="${OUT_ROOT:-/app/output/nips2017_smoke}"
 generator_mode="${GENERATOR_MODE:-isolated}"
-adapter_feature_guidance="${ADAPTER_FEATURE_GUIDANCE:-0}"
 
 case "$generator_mode" in
-    isolated|isolated_split|frozen_legacy|legacy) ;;
+    isolated|legacy) ;;
     *)
-        echo "GENERATOR_MODE must be isolated, isolated_split, frozen_legacy, or legacy" >&2
+        echo "GENERATOR_MODE must be isolated or legacy" >&2
         exit 2
         ;;
 esac
-
-case "$adapter_feature_guidance" in
-    0|1) ;;
-    *)
-        echo "ADAPTER_FEATURE_GUIDANCE must be 0 or 1" >&2
-        exit 2
-        ;;
-esac
-if [[ "$adapter_feature_guidance" == "1" && "$generator_mode" != "isolated" && "$generator_mode" != "isolated_split" ]]; then
-    echo "ADAPTER_FEATURE_GUIDANCE=1 requires GENERATOR_MODE=isolated or isolated_split" >&2
-    exit 2
-fi
-adapter_feature_guidance_args=()
-if [[ "$adapter_feature_guidance" == "1" ]]; then
-    adapter_feature_guidance_args+=(--adapter_feature_guidance)
-fi
 
 if [[ ! -f "$data_root/images.csv" ]]; then
     echo "missing NIPS2017 smoke metadata: $data_root/images.csv" >&2
@@ -65,7 +48,6 @@ exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
     --train_csv "$data_root/images.csv" \
     --model_type res50 \
     --generator_mode "$generator_mode" \
-    "${adapter_feature_guidance_args[@]}" \
     --eps 10 \
     --target -1 \
     --batch_size 16 \

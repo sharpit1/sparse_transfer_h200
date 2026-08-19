@@ -20,7 +20,6 @@ python_bin="${PYTHON:-python}"
 gpu_id="${GPU_ID:-0}"
 out_root="${OUT_ROOT:-/app/output/sharpit1}"
 generator_mode="${GENERATOR_MODE:-isolated}"
-adapter_feature_guidance="${ADAPTER_FEATURE_GUIDANCE:-0}"
 train_epochs="${TRAIN_EPOCHS:-15}"
 max_batches_per_epoch="${MAX_BATCHES_PER_EPOCH:-0}"
 ddsc_ema_decay="${DDSC_EMA_DECAY:-0.0}"
@@ -32,28 +31,12 @@ layer1_dropout_eot_samples="${LAYER1_DROPOUT_EOT_SAMPLES:-4}"
 layer1_dropout_eot_reduction="${LAYER1_DROPOUT_EOT_REDUCTION:-logits}"
 
 case "$generator_mode" in
-    isolated|isolated_split|frozen_legacy|legacy) ;;
+    isolated|legacy) ;;
     *)
-        echo "GENERATOR_MODE must be isolated, isolated_split, frozen_legacy, or legacy" >&2
+        echo "GENERATOR_MODE must be isolated or legacy" >&2
         exit 2
         ;;
 esac
-
-case "$adapter_feature_guidance" in
-    0|1) ;;
-    *)
-        echo "ADAPTER_FEATURE_GUIDANCE must be 0 or 1" >&2
-        exit 2
-        ;;
-esac
-if [[ "$adapter_feature_guidance" == "1" && "$generator_mode" != "isolated" && "$generator_mode" != "isolated_split" ]]; then
-    echo "ADAPTER_FEATURE_GUIDANCE=1 requires GENERATOR_MODE=isolated or isolated_split" >&2
-    exit 2
-fi
-adapter_feature_guidance_args=()
-if [[ "$adapter_feature_guidance" == "1" ]]; then
-    adapter_feature_guidance_args+=(--adapter_feature_guidance)
-fi
 
 case "$layer1_dropout_mode" in
     off|frequency_channel) ;;
@@ -147,7 +130,6 @@ train_dir="$(resolve_imagenet_train_dir "${2:-}")"
 echo "imagenet_train_dir=$train_dir"
 echo "batch_size=16 epochs=$train_epochs max_batches_per_epoch=$max_batches_per_epoch warmup_epochs=2 damping=$damping ema_decay=$ddsc_ema_decay"
 echo "layer1_dropout_mode=$layer1_dropout_mode p=$layer1_dropout_p channel_ratio=$layer1_dropout_channel_ratio hf_ratio=$layer1_dropout_hf_ratio eot_samples=$layer1_dropout_eot_samples eot_reduction=$layer1_dropout_eot_reduction"
-echo "generator_mode=$generator_mode adapter_feature_guidance=$adapter_feature_guidance"
 
 export CUDA_VISIBLE_DEVICES="$gpu_id"
 export TORCH_HOME="${TORCH_HOME:-$root/.cache/torch}"
@@ -161,7 +143,6 @@ exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
     --train_dir "$train_dir" \
     --model_type res50 \
     --generator_mode "$generator_mode" \
-    "${adapter_feature_guidance_args[@]}" \
     --layer1_dropout_mode "$layer1_dropout_mode" \
     --layer1_dropout_p "$layer1_dropout_p" \
     --layer1_dropout_channel_ratio "$layer1_dropout_channel_ratio" \

@@ -1,14 +1,12 @@
-"""Multi-mode GPG trainer with DDSC lambda-1 control.
+"""Dual-mode GPG trainer with DDSC lambda-1 control.
 
-This file is based on ``GPG_train.py`` and supports four generator modes:
+This file is based on ``GPG_train.py`` and supports two generator modes:
 
 1. adapt the sparse-loss multiplier lambda-1 once per controlled epoch from
    the observed binary spatial support; and
-2. select the original learned dual-encoder GPG generator (``legacy``), an
-   ImageNet ResNet-50 V1 layer1 prefix with the unchanged legacy back end
-   (``frozen_legacy``), or the same frozen prefix with the parameter-reduced
-   shared-lite decoder (``isolated``), or the same adapter/residual body with
-   separate perturbation and mask upsampling trunks (``isolated_split``); and
+2. select either the original learned dual-encoder GPG generator (``legacy``)
+   or an ImageNet ResNet-50 V1 layer1 prefix with the parameter-reduced
+   shared-lite decoder (``isolated``); and
 3. optionally regularize only the attack-objective ResNet-50 with isolated
    layer1 frequency-channel dropout and clean-inclusive EOT.  The clean-label
    model and, when selected, the generator's frozen encoder remain
@@ -55,21 +53,15 @@ from tqdm import tqdm
 try:
     from .generators_ddsc_gpg import (
         DDSCGPGGenerator,
-        DDSCSplitGPGGenerator,
         GENERATOR_TYPE as ISOLATED_GENERATOR_TYPE,
         IMAGENET_MEAN,
         IMAGENET_STD,
-        SPLIT_GENERATOR_TYPE,
         module_state_sha256,
         parameter_count,
     )
     from .generators_legacy_gpg import (
         LEGACY_GENERATOR_TYPE,
         LegacyGPGGenerator,
-    )
-    from .generators_frozen_legacy_gpg import (
-        FROZEN_LEGACY_GENERATOR_TYPE,
-        FrozenResNetLegacyGPGGenerator,
     )
     from .ddsc_layer1_dropout_eot import (
         IsolatedResNet50Layer1ChannelDropoutEOT,
@@ -78,21 +70,15 @@ try:
 except ImportError:
     from generators_ddsc_gpg import (  # type: ignore[no-redef]
         DDSCGPGGenerator,
-        DDSCSplitGPGGenerator,
         GENERATOR_TYPE as ISOLATED_GENERATOR_TYPE,
         IMAGENET_MEAN,
         IMAGENET_STD,
-        SPLIT_GENERATOR_TYPE,
         module_state_sha256,
         parameter_count,
     )
     from generators_legacy_gpg import (  # type: ignore[no-redef]
         LEGACY_GENERATOR_TYPE,
         LegacyGPGGenerator,
-    )
-    from generators_frozen_legacy_gpg import (  # type: ignore[no-redef]
-        FROZEN_LEGACY_GENERATOR_TYPE,
-        FrozenResNetLegacyGPGGenerator,
     )
     from ddsc_layer1_dropout_eot import (  # type: ignore[no-redef]
         IsolatedResNet50Layer1ChannelDropoutEOT,
@@ -102,18 +88,15 @@ except ImportError:
 
 LOGGER = logging.getLogger("ddsc_gpg")
 _RUN_TRAINING_LOCK = threading.Lock()
-CHECKPOINT_FORMAT = "ddsc_gpg_training_v9"
-PREVIOUS_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v8"
+CHECKPOINT_FORMAT = "ddsc_gpg_training_v8"
 DROPOUT_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v7"
 LEGACY_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v6"
 INFERENCE_CHECKPOINT_FORMAT = "ddsc_gpg_inference_v3"
 PREVIOUS_INFERENCE_CHECKPOINT_FORMAT = "ddsc_gpg_inference_v2"
 LEGACY_GPG_PARAMETER_COUNT = 8_592_516
-GENERATOR_MODES = ("isolated", "isolated_split", "frozen_legacy", "legacy")
+GENERATOR_MODES = ("isolated", "legacy")
 GENERATOR_TYPES_BY_MODE = {
     "isolated": ISOLATED_GENERATOR_TYPE,
-    "isolated_split": SPLIT_GENERATOR_TYPE,
-    "frozen_legacy": FROZEN_LEGACY_GENERATOR_TYPE,
     "legacy": LEGACY_GENERATOR_TYPE,
 }
 ISOLATED_DECODER_DEFAULTS = {
@@ -140,7 +123,6 @@ RESUME_EXACT_ARGS = (
     "train_csv",
     "model_type",
     "generator_mode",
-    "adapter_feature_guidance",
     "eps",
     "target",
     "batch_size",
@@ -534,8 +516,8 @@ def load_controller_state(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train DDSC-GPG with dynamic lambda-1 using a selectable "
-            "generator architecture"
+            "Train DDSC-GPG with dynamic lambda-1 using a selectable legacy "
+            "or isolated generator"
         )
     )
     parser.add_argument(
@@ -565,21 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="isolated",
         help=(
             "isolated uses the frozen ResNet-50 layer1 shared-lite generator; "
-            "isolated_split shares the adapter/residual body and learns one "
-            "upsampling trunk per output; "
-            "frozen_legacy keeps the frozen ResNet layer1 output at 256 "
-            "channels and uses the unchanged legacy back end; legacy uses "
-            "the original learned dual-encoder GPG generator"
-        ),
-    )
-    parser.add_argument(
-        "--adapter_feature_guidance",
-        "--adapter-feature-guidance",
-        dest="adapter_feature_guidance",
-        action="store_true",
-        help=(
-            "for isolated adapter generators, add the original-style L2 "
-            "feature loss after separate clean/PGD adapters"
+            "legacy uses the original learned dual-encoder GPG generator"
         ),
     )
     parser.add_argument(
@@ -709,7 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--decoder_upsample_backend",
         choices=("transpose", "nearest_conv"),
         default=ISOLATED_DECODER_DEFAULTS["decoder_upsample_backend"],
-        help="adapter-lite backend; transpose matches the frozen-SPGD default",
+        help="shared-lite backend; transpose matches the frozen-SPGD default",
     )
     parser.add_argument("--save_every", type=int, default=1)
 
@@ -799,8 +767,7 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.decoder_num_blocks < 0:
         raise ValueError("decoder_num_blocks must be non-negative")
-    adapter_modes = {"isolated", "isolated_split"}
-    if args.generator_mode not in adapter_modes:
+    if args.generator_mode == "legacy":
         changed_decoder_options = {
             name: getattr(args, name)
             for name, default in ISOLATED_DECODER_DEFAULTS.items()
@@ -809,14 +776,9 @@ def validate_args(args: argparse.Namespace) -> None:
         if changed_decoder_options:
             raise ValueError(
                 "decoder_width/decoder_num_blocks/decoder_upsample_backend "
-                "configure only the isolated adapter generators; legacy-back-end "
-                "modes require "
+                "configure only the isolated generator; legacy mode requires "
                 f"their defaults, got {changed_decoder_options}"
             )
-    if args.adapter_feature_guidance and args.generator_mode not in adapter_modes:
-        raise ValueError(
-            "--adapter_feature_guidance requires isolated or isolated_split"
-        )
     if args.ddsc_warmup_epochs < 0:
         raise ValueError("ddsc_warmup_epochs must be non-negative")
     if not 0.0 < args.ddsc_target_density <= 1.0:
@@ -878,7 +840,7 @@ def _normalize_checkpoint_train_args(
     *,
     checkpoint_format: str,
 ) -> dict[str, Any]:
-    """Normalize supported checkpoints into the current v9 argument schema."""
+    """Normalize supported checkpoints into the current v8 argument schema."""
 
     if not isinstance(stored_args, Mapping):
         raise ValueError("checkpoint train_args must be a mapping")
@@ -890,38 +852,12 @@ def _normalize_checkpoint_train_args(
         if present != dropout_keys:
             missing = sorted(dropout_keys - present)
             raise ValueError(
-                "v9 checkpoint layer1-dropout arguments are incomplete: "
-                f"missing={missing}"
-            )
-        if "generator_mode" not in normalized:
-            raise ValueError("v9 checkpoint generator_mode is missing")
-        if type(normalized.get("adapter_feature_guidance")) is not bool:
-            raise ValueError(
-                "v9 checkpoint adapter_feature_guidance must be boolean"
-            )
-        generator_type_for_mode(normalized["generator_mode"])
-        return normalized
-    if checkpoint_format == PREVIOUS_TRAINING_CHECKPOINT_FORMAT:
-        if present != dropout_keys:
-            missing = sorted(dropout_keys - present)
-            raise ValueError(
                 "v8 checkpoint layer1-dropout arguments are incomplete: "
                 f"missing={missing}"
             )
         if "generator_mode" not in normalized:
             raise ValueError("v8 checkpoint generator_mode is missing")
-        if "adapter_feature_guidance" in normalized:
-            raise ValueError(
-                "v8 checkpoint must not contain adapter_feature_guidance"
-            )
-        if normalized["generator_mode"] not in {
-            "isolated",
-            "frozen_legacy",
-            "legacy",
-        }:
-            raise ValueError("v8 checkpoint generator_mode is unsupported")
         generator_type_for_mode(normalized["generator_mode"])
-        normalized["adapter_feature_guidance"] = False
         return normalized
     if checkpoint_format == DROPOUT_TRAINING_CHECKPOINT_FORMAT:
         if present != dropout_keys:
@@ -934,7 +870,6 @@ def _normalize_checkpoint_train_args(
             raise ValueError("v7 checkpoint must not contain generator_mode")
         normalized.setdefault("train_csv", "")
         normalized["generator_mode"] = "isolated"
-        normalized["adapter_feature_guidance"] = False
         return normalized
     if checkpoint_format == LEGACY_TRAINING_CHECKPOINT_FORMAT:
         if present:
@@ -947,7 +882,6 @@ def _normalize_checkpoint_train_args(
         normalized.update(LAYER1_DROPOUT_DEFAULTS)
         normalized.setdefault("train_csv", "")
         normalized["generator_mode"] = "isolated"
-        normalized["adapter_feature_guidance"] = False
         return normalized
     raise ValueError(f"unsupported training checkpoint format: {checkpoint_format!r}")
 
@@ -1948,7 +1882,6 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         path,
         expected_formats=(
             CHECKPOINT_FORMAT,
-            PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
             DROPOUT_TRAINING_CHECKPOINT_FORMAT,
             LEGACY_TRAINING_CHECKPOINT_FORMAT,
         ),
@@ -2149,7 +2082,7 @@ def build_generator_from_inference_checkpoint(
     # so host default tensor settings cannot touch accelerator RNG or placement.
     with torch.inference_mode(False):
         with torch.random.fork_rng(devices=[]), torch.device("cpu"):
-            if generator_mode in {"isolated", "isolated_split"}:
+            if generator_mode == "isolated":
                 if (
                     encoder.get("architecture") != "resnet50"
                     or encoder.get("weights_enum") != "IMAGENET1K_V1"
@@ -2157,34 +2090,9 @@ def build_generator_from_inference_checkpoint(
                     or encoder.get("frozen") is not True
                 ):
                     raise ValueError("inference encoder metadata is incompatible")
-                expected_variant = (
-                    "shared_lite"
-                    if generator_mode == "isolated"
-                    else "split_lite"
-                )
-                if decoder.get("variant") != expected_variant:
+                if decoder.get("variant") != "shared_lite":
                     raise ValueError("inference decoder variant is incompatible")
-                guidance_metadata = architecture.get(
-                    "adapter_feature_guidance"
-                )
-                adapter_feature_guidance = guidance_metadata is not None
-                if adapter_feature_guidance and guidance_metadata != {
-                    "enabled": True,
-                    "location": "post_adapter_pre_residual_body",
-                    "pgd_branch": "separate_trainable_adapter",
-                    "pgd_input": "image_plus_projected_pgd_delta",
-                    "distance": "l2_norm",
-                    "used_during_inference": False,
-                }:
-                    raise ValueError(
-                        "inference adapter feature-guidance metadata is incompatible"
-                    )
-                generator_class = (
-                    DDSCGPGGenerator
-                    if generator_mode == "isolated"
-                    else DDSCSplitGPGGenerator
-                )
-                generator = generator_class(
+                generator = DDSCGPGGenerator(
                     torchvision.models.resnet50(weights=None),
                     inception=payload["model_type"] == "incv3",
                     decoder_width=_require_plain_int(
@@ -2194,29 +2102,6 @@ def build_generator_from_inference_checkpoint(
                         decoder.get("num_blocks"), "decoder.num_blocks"
                     ),
                     decoder_upsample_backend=str(decoder.get("upsample_backend")),
-                    adapter_feature_guidance=adapter_feature_guidance,
-                ).float()
-            elif generator_mode == "frozen_legacy":
-                if (
-                    encoder.get("architecture") != "resnet50"
-                    or encoder.get("weights_enum") != "IMAGENET1K_V1"
-                    or encoder.get("stage") != "layer1"
-                    or encoder.get("output_channels") != 256
-                    or encoder.get("adapter") != "none"
-                    or encoder.get("frozen") is not True
-                    or decoder.get("variant") != "legacy_dual_head"
-                    or decoder.get("input_channels") != 256
-                    or decoder.get("residual_blocks") != 6
-                    or decoder.get("residual_block_type") != "legacy_full"
-                    or decoder.get("shared_upsample_trunk") is not False
-                ):
-                    raise ValueError(
-                        "frozen_legacy inference architecture metadata is "
-                        "incompatible"
-                    )
-                generator = FrozenResNetLegacyGPGGenerator(
-                    torchvision.models.resnet50(weights=None),
-                    inception=payload["model_type"] == "incv3",
                 ).float()
             else:
                 if (
@@ -2867,21 +2752,12 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         validate_resume_metadata(resume_payload, args, controller_config)
         lineage_fingerprint = file_fingerprint(args.CP_path)
 
-    generator_descriptors = {
-        "isolated": (
-            f"isolated_resnet50_layer1_shared_lite_"
-            f"{args.decoder_upsample_backend}"
-        ),
-        "isolated_split": (
-            f"isolated_resnet50_layer1_split_lite_"
-            f"{args.decoder_upsample_backend}"
-        ),
-        "frozen_legacy": "frozen_resnet50_layer1_legacy_decoder",
-        "legacy": "legacy_dual_encoder",
-    }
-    generator_descriptor = generator_descriptors[args.generator_mode]
-    if args.adapter_feature_guidance:
-        generator_descriptor += "_adapter_feature_guidance"
+    generator_descriptor = (
+        f"isolated_resnet50_layer1_shared_lite_"
+        f"{args.decoder_upsample_backend}"
+        if args.generator_mode == "isolated"
+        else "legacy_dual_encoder"
+    )
     output_name = (
         f"DDSC_GPG_{args.model_type}_tar_{args.target}_eps_{args.eps}_"
         f"Load_{args.load_CP}_lam1init_{args.lam_1}_targetdens_"
@@ -2907,35 +2783,19 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             expected_model_type=args.model_type,
             actual_contract=current_attack_model_contract,
         )
-    if args.generator_mode in {
-        "isolated",
-        "isolated_split",
-        "frozen_legacy",
-    }:
+    if args.generator_mode == "isolated":
         encoder_backbone = build_encoder_backbone(
             args.model_type,
             clean_attack_model,
             continuing=resume_payload is not None,
         )
-        if args.generator_mode in {"isolated", "isolated_split"}:
-            generator_class = (
-                DDSCGPGGenerator
-                if args.generator_mode == "isolated"
-                else DDSCSplitGPGGenerator
-            )
-            net_g: torch.nn.Module = generator_class(
-                encoder_backbone,
-                inception=args.model_type == "incv3",
-                decoder_width=args.decoder_width,
-                decoder_num_blocks=args.decoder_num_blocks,
-                decoder_upsample_backend=args.decoder_upsample_backend,
-                adapter_feature_guidance=args.adapter_feature_guidance,
-            )
-        else:
-            net_g = FrozenResNetLegacyGPGGenerator(
-                encoder_backbone,
-                inception=args.model_type == "incv3",
-            )
+        net_g: torch.nn.Module = DDSCGPGGenerator(
+            encoder_backbone,
+            inception=args.model_type == "incv3",
+            decoder_width=args.decoder_width,
+            decoder_num_blocks=args.decoder_num_blocks,
+            decoder_upsample_backend=args.decoder_upsample_backend,
+        )
         if encoder_backbone is not clean_attack_model:
             del encoder_backbone
     else:
@@ -3098,22 +2958,10 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         LEGACY_GPG_PARAMETER_COUNT,
         reduction,
     )
-    if args.generator_mode in {"isolated", "isolated_split"}:
-        if args.adapter_feature_guidance:
-            LOGGER.info(
-                "adapter feature guidance enabled after separate clean/PGD "
-                "adapters; pixel-space PGD guidance remains enabled"
-            )
-        else:
-            LOGGER.info(
-                "adapter feature guidance disabled; pixel-space PGD guidance "
-                "remains enabled"
-            )
-    elif args.generator_mode == "frozen_legacy":
+    if args.generator_mode == "isolated":
         LOGGER.info(
-            "frozen ResNet layer1 with unchanged legacy back end selected; "
-            "legacy feature guidance disabled and pixel-space PGD guidance "
-            "remains enabled"
+            "legacy feature guidance disabled: frozen feature distance has no "
+            "decoder gradient; pixel-space PGD guidance remains enabled"
         )
     else:
         LOGGER.info(
@@ -3210,12 +3058,6 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             net_g.train()
             optimizer.zero_grad(set_to_none=True)
             if args.generator_mode == "legacy":
-                adv, adv_inf, adv_0, adv_00, feature_guidance_loss = net_g(
-                    image,
-                    args.eps / 255.0,
-                    image + grad_delta,
-                )
-            elif args.adapter_feature_guidance:
                 adv, adv_inf, adv_0, adv_00, feature_guidance_loss = net_g(
                     image,
                     args.eps / 255.0,
@@ -3449,8 +3291,6 @@ __all__ = [
     "CHECKPOINT_FORMAT",
     "DEFAULT_WORKER_TIMEOUT_SECONDS",
     "DROPOUT_TRAINING_CHECKPOINT_FORMAT",
-    "FROZEN_LEGACY_GENERATOR_TYPE",
-    "FrozenResNetLegacyGPGGenerator",
     "GENERATOR_MODES",
     "GENERATOR_TYPES_BY_MODE",
     "INFERENCE_CHECKPOINT_FORMAT",
@@ -3461,8 +3301,6 @@ __all__ = [
     "LEGACY_TRAINING_CHECKPOINT_FORMAT",
     "NIPS2017Dataset",
     "PREVIOUS_INFERENCE_CHECKPOINT_FORMAT",
-    "PREVIOUS_TRAINING_CHECKPOINT_FORMAT",
-    "SPLIT_GENERATOR_TYPE",
     "DDSCControllerConfig",
     "DDSCControllerState",
     "IsolatedResNet50Layer1ChannelDropoutEOT",
