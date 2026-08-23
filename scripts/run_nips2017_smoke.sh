@@ -43,7 +43,7 @@ export PYTHONFAULTHANDLER=1
 
 mkdir -p "$TORCH_HOME" "$out_root"
 
-exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
+exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_generator_modes_train.py" \
     --train_dir "$data_root/images" \
     --train_csv "$data_root/images.csv" \
     --model_type res50 \

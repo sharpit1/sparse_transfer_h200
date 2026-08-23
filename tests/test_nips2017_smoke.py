@@ -34,7 +34,7 @@ class NIPS2017SmokeTests(unittest.TestCase):
             import torch
             from torchvision import transforms
 
-            from third_party.GPG.DDSC_GPG_train import (
+            from third_party.GPG.DDSC_GPG_generator_modes_train import (
                 NIPS2017Dataset,
                 dataset_contract,
             )
