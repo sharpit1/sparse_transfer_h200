@@ -1,0 +1,6 @@
+# Evaluation-only packages. The FaaS launcher installs these into an isolated
+# --target directory and never installs or replaces torch/torchvision.
+timm==1.0.28
+huggingface-hub==1.24.0
+safetensors==0.8.0
+PyYAML==6.0.3
