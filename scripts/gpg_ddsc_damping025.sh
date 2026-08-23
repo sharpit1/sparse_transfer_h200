@@ -5,6 +5,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd -- "${script_dir}/.." && pwd)"
 trainer="${root}/third_party/GPG/DDSC_GPG_train.py"
 evaluator="${root}/third_party/GPG/tools/evaluate_ddsc_gpg_all_model_t.py"
+eval_bootstrapper="${root}/third_party/GPG/tools/bootstrap_transfer_eval.py"
 openmmlab_vit_checkpoint="${OPENMMLAB_VIT_CHECKPOINT:-${root}/artifacts/pretrained/vit-base-p16_pt-32xb128-mae_in1k_20220623-4c544545.pth}"
 
 python_bin="${PYTHON:-python}"
@@ -31,6 +32,10 @@ eval_device="${EVAL_DEVICE:-${device}}"
 default_eval_models="dense161 vgg16 incv3 res50 WideRes50 EffNetB6 deit tnt Swin_Tiny twins vit deit_base tnt_base swin_small swin_base twins_base vit_small vit_base"
 eval_models="${EVAL_MODELS:-${default_eval_models}}"
 eval_resume="${EVAL_RESUME:-1}"
+auto_install_eval_deps="${AUTO_INSTALL_EVAL_DEPS:-1}"
+auto_download_eval_assets="${AUTO_DOWNLOAD_EVAL_ASSETS:-1}"
+eval_deps_dir="${EVAL_DEPS_DIR:-}"
+eval_deps_wheelhouse="${EVAL_DEPS_WHEELHOUSE:-}"
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -55,6 +60,9 @@ EPOCHS is the total target epoch count, not the number of additional epochs.
 All trajectory and runtime settings must match the checkpoint exactly.
 Evaluation defaults to 18 unique victim implementations and requires
 cached/downloadable pretrained weights. Set EVAL_MODELS to override the list.
+Missing evaluator packages and the OpenMMLab ViT checkpoint are bootstrapped
+by default. Set AUTO_INSTALL_EVAL_DEPS=0 or AUTO_DOWNLOAD_EVAL_ASSETS=0 to
+require pre-provisioned dependencies or assets instead.
 EOF
     exit 2
 }
@@ -71,6 +79,14 @@ esac
 case "${eval_resume}" in
     0|1) ;;
     *) fail "EVAL_RESUME must be 0 or 1" ;;
+esac
+case "${auto_install_eval_deps}" in
+    0|1) ;;
+    *) fail "AUTO_INSTALL_EVAL_DEPS must be 0 or 1" ;;
+esac
+case "${auto_download_eval_assets}" in
+    0|1) ;;
+    *) fail "AUTO_DOWNLOAD_EVAL_ASSETS must be 0 or 1" ;;
 esac
 
 for integer_setting in \
@@ -194,12 +210,13 @@ resolve_imagenet_val_dir() {
 val_dir=""
 eval_model_args=()
 eval_model_list=()
+eval_pythonpath=""
 if [[ "${run_transfer_eval}" == "1" ]]; then
     val_dir="$(resolve_imagenet_val_dir "${2:-}")" || \
         fail "ImageNet validation directory was not found"
     [[ -f "${evaluator}" ]] || fail "Evaluator is missing: ${evaluator}"
-    "${python_bin}" -c 'import timm' || \
-        fail "Python package timm is required for transfer evaluation"
+    [[ -f "${eval_bootstrapper}" ]] || \
+        fail "Evaluation bootstrapper is missing: ${eval_bootstrapper}"
     "${python_bin}" - "${train_dir}" "${val_dir}" "${eval_samples}" <<'PY'
 import sys
 from pathlib import Path
@@ -237,10 +254,38 @@ PY
             [[ "${model_name}" == "vit" ]] && needs_openmmlab_vit=1
         done
     fi
-    if [[ "${needs_openmmlab_vit}" == "1" ]]; then
-        [[ -f "${openmmlab_vit_checkpoint}" ]] || \
-            fail "OpenMMLab ViT checkpoint is missing: ${openmmlab_vit_checkpoint}"
+
+    eval_python_tag="$(
+        "${python_bin}" -c \
+            'import platform, sys; print(f"py{sys.version_info.major}.{sys.version_info.minor}-{platform.machine()}")'
+    )" || fail "Cannot determine the evaluator Python ABI"
+    if [[ -z "${eval_deps_dir}" ]]; then
+        eval_deps_dir="${root}/.cache/eval-deps/${eval_python_tag}"
     fi
+    eval_pythonpath="${eval_deps_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+    eval_bootstrap_args=(
+        "${python_bin}" "${eval_bootstrapper}"
+        --deps-dir "${eval_deps_dir}"
+        --auto-install-deps "${auto_install_eval_deps}"
+        --auto-download-assets "${auto_download_eval_assets}"
+    )
+    if [[ -n "${eval_deps_wheelhouse}" ]]; then
+        eval_bootstrap_args+=(--wheelhouse "${eval_deps_wheelhouse}")
+    fi
+    if [[ "${needs_openmmlab_vit}" == "1" ]]; then
+        eval_bootstrap_args+=(
+            --require-vit
+            --vit-checkpoint "${openmmlab_vit_checkpoint}"
+        )
+    fi
+    pip_cache_dir="${PIP_CACHE_DIR:-${root}/.cache/pip}"
+    mkdir -p -- "${pip_cache_dir}" "${eval_deps_dir}"
+    printf 'eval_dependency_target=%s auto_install=%s\n' \
+        "${eval_deps_dir}" "${auto_install_eval_deps}"
+    printf 'auto_download_eval_assets=%s\n' "${auto_download_eval_assets}"
+    PIP_CACHE_DIR="${pip_cache_dir}" PYTHONPATH="${eval_pythonpath}" \
+        "${eval_bootstrap_args[@]}" || \
+        fail "Transfer evaluation dependency/asset bootstrap failed"
 fi
 
 checkpoint_args=()
@@ -423,7 +468,8 @@ eval_stdout_log="${eval_out_dir}/evaluate_all_model_t.stdout.log"
 printf 'evaluator_command='
 printf '%q ' "${evaluator_command[@]}"
 printf '\neval_stdout_log=%s\n' "${eval_stdout_log}"
-"${evaluator_command[@]}" 2>&1 | tee "${eval_stdout_log}"
+PYTHONPATH="${eval_pythonpath}" \
+    "${evaluator_command[@]}" 2>&1 | tee "${eval_stdout_log}"
 
 results_json="${eval_out_dir}/results.json"
 [[ -s "${results_json}" ]] || fail "Evaluation results are missing: ${results_json}"

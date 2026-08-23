@@ -25,9 +25,25 @@ continuation checkpoint.
 
 The transfer evaluator downloads torchvision/timm weights through their
 standard caches. Set `TORCH_HOME` and `HF_HOME` to pre-populated locations for
-offline execution. The `vit` victim additionally requires the official
-OpenMMLab MAE ViT-Base checkpoint. It is intentionally excluded from Git by
-the `*.pth` rule. Download and verify it as follows:
+offline execution. On a fresh FaaS clone, the launcher installs the pinned
+evaluation-only packages under `.cache/eval-deps/<python-platform>` and adds
+that directory only to the evaluator's `PYTHONPATH`. The image's CUDA-matched
+`torch` and `torchvision` are neither resolved nor replaced: timm is installed
+with `--no-deps`, while the non-PyTorch support stack is installed separately.
+
+Set `AUTO_INSTALL_EVAL_DEPS=0` to require pre-provisioned packages. Set
+`EVAL_DEPS_DIR` to reuse an existing isolated package directory, or
+`EVAL_DEPS_WHEELHOUSE` to install from an offline wheel directory. The latter
+uses pip's `--no-index --find-links` mode.
+
+The `vit` victim additionally requires the official OpenMMLab MAE ViT-Base
+checkpoint. It is intentionally excluded from Git by the `*.pth` rule. When
+the default 18-model list includes `vit`, a missing checkpoint is downloaded
+from the official URL to a temporary file, SHA-256 verified, and atomically
+installed before training starts. An existing mismatched file or symbolic link
+is never overwritten and stops the run. Set
+`AUTO_DOWNLOAD_EVAL_ASSETS=0` to require a pre-provisioned artifact. To
+download it manually:
 
 ```bash
 mkdir -p artifacts/pretrained
@@ -44,6 +60,9 @@ Expected SHA-256:
 ```
 
 Alternatively, set `OPENMMLAB_VIT_CHECKPOINT` to an existing artifact path.
+Automatic download still verifies the fixed SHA-256 at that path and never
+uses or overwrites a mismatched file.
+
 The original generator-mode DDSC smoke and ImageNet launchers remain
 available; they use the preserved
 `third_party/GPG/DDSC_GPG_generator_modes_train.py` compatibility entry point.
