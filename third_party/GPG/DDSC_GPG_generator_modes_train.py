@@ -1,15 +1,16 @@
-"""Multi-architecture sparse-generator trainer with DDSC lambda-1 control.
+"""GPG trainer with DDSC lambda-1 control and three generator modes.
 
-This file is based on ``GPG_train.py``.  The legacy trainer and generator are
-left untouched.  The intended method changes are limited to:
+This file is based on ``GPG_train.py`` and:
 
 1. adapt the sparse-loss multiplier lambda-1 once per controlled epoch from
    the observed binary spatial support; and
-2. select the parameter-reduced ``simple`` generator or the vendored GPG,
-   TSAA, or EGS-TSSA generator and preserve its source loss terms; and
+2. select the original learned dual-encoder generator (``legacy``), the
+   frozen ResNet-50 layer1 shared-lite generator (``isolated``), or its
+   independently upsampled two-branch variant (``isolated_split``); and
 3. optionally regularize only the attack-objective ResNet-50 with isolated
    layer1 frequency-channel dropout and clean-inclusive EOT.  The clean-label
-   path and every generator remain isolated from this classifier dropout.
+   model and, when selected, the generator's frozen encoder remain
+   dropout-free.
 
 The original GPG sparse loss remains a sum, so the DDSC restoring-gain default
 is resolved in the same numerical scale as ``--lam_1``.  Values such as 2 or 4
@@ -19,6 +20,7 @@ from mean-loss DDSC experiments must not be copied directly into this trainer.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import logging
@@ -27,10 +29,12 @@ import os
 import platform
 import random
 import threading
+import time
 import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -42,102 +46,77 @@ import torchvision
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
-from PIL import __version__ as PILLOW_VERSION
+from PIL import Image, __version__ as PILLOW_VERSION
 from torch.utils.data import Subset
 from tqdm import tqdm
 
 try:
-    from .generators_ddsc_gpg import (
+    from .generators_ddsc_gpg_modes import (
         DDSCGPGGenerator,
-        GENERATOR_TYPE,
+        DDSCSplitGPGGenerator,
+        GENERATOR_TYPE as ISOLATED_GENERATOR_TYPE,
         IMAGENET_MEAN,
         IMAGENET_STD,
+        SPLIT_GENERATOR_TYPE,
         module_state_sha256,
         parameter_count,
+    )
+    from .generators_legacy_gpg import (
+        LEGACY_GENERATOR_TYPE,
+        LegacyGPGGenerator,
     )
     from .ddsc_layer1_dropout_eot import (
         IsolatedResNet50Layer1ChannelDropoutEOT,
         attack_model_loss_and_logits,
     )
 except ImportError:
-    from generators_ddsc_gpg import (  # type: ignore[no-redef]
+    from generators_ddsc_gpg_modes import (  # type: ignore[no-redef]
         DDSCGPGGenerator,
-        GENERATOR_TYPE,
+        DDSCSplitGPGGenerator,
+        GENERATOR_TYPE as ISOLATED_GENERATOR_TYPE,
         IMAGENET_MEAN,
         IMAGENET_STD,
+        SPLIT_GENERATOR_TYPE,
         module_state_sha256,
         parameter_count,
+    )
+    from generators_legacy_gpg import (  # type: ignore[no-redef]
+        LEGACY_GENERATOR_TYPE,
+        LegacyGPGGenerator,
     )
     from ddsc_layer1_dropout_eot import (  # type: ignore[no-redef]
         IsolatedResNet50Layer1ChannelDropoutEOT,
         attack_model_loss_and_logits,
     )
 
-try:
-    from .ddsc_architecture_modes import (
-        EGSStructuredMask,
-        SUPPORTED_GENERATOR_TYPES,
-        architecture_mode_from_generator_type,
-        build_original_generator,
-        canonical_architecture_mode,
-        controller_support_mask,
-        egs_conditioner_contract,
-        egs_lambda2_for_epoch,
-        forward_generator_inference,
-        forward_generator_training,
-        generator_architecture_metadata,
-        generator_type_for_architecture_mode,
-        iter_generator_trainable_parameters,
-        legacy_cw_loss,
-        quantization_loss,
-        validate_egs_conditioner_contract,
-    )
-except ImportError:
-    from ddsc_architecture_modes import (  # type: ignore[no-redef]
-        EGSStructuredMask,
-        SUPPORTED_GENERATOR_TYPES,
-        architecture_mode_from_generator_type,
-        build_original_generator,
-        canonical_architecture_mode,
-        controller_support_mask,
-        egs_conditioner_contract,
-        egs_lambda2_for_epoch,
-        forward_generator_inference,
-        forward_generator_training,
-        generator_architecture_metadata,
-        generator_type_for_architecture_mode,
-        iter_generator_trainable_parameters,
-        legacy_cw_loss,
-        quantization_loss,
-        validate_egs_conditioner_contract,
-    )
-
 
 LOGGER = logging.getLogger("ddsc_gpg")
 _RUN_TRAINING_LOCK = threading.Lock()
-CHECKPOINT_FORMAT = "ddsc_gpg_training_v9"
-PREVIOUS_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v8"
-LAYER1_DROPOUT_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v7"
+CHECKPOINT_FORMAT = "ddsc_gpg_training_v8"
+DROPOUT_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v7"
 LEGACY_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v6"
 INFERENCE_CHECKPOINT_FORMAT = "ddsc_gpg_inference_v3"
-LEGACY_INFERENCE_CHECKPOINT_FORMAT = "ddsc_gpg_inference_v2"
+PREVIOUS_INFERENCE_CHECKPOINT_FORMAT = "ddsc_gpg_inference_v2"
 LEGACY_GPG_PARAMETER_COUNT = 8_592_516
+GENERATOR_MODES = ("isolated", "isolated_split", "legacy")
+GENERATOR_TYPES_BY_MODE = {
+    "isolated": ISOLATED_GENERATOR_TYPE,
+    "isolated_split": SPLIT_GENERATOR_TYPE,
+    "legacy": LEGACY_GENERATOR_TYPE,
+}
+ISOLATED_DECODER_DEFAULTS = {
+    "decoder_width": 128,
+    "decoder_num_blocks": 3,
+    "decoder_upsample_backend": "transpose",
+}
 DEFAULT_WORKER_TIMEOUT_SECONDS = 120.0
 LAYER1_DROPOUT_DEFAULTS = {
     "layer1_dropout_mode": "off",
-    "layer1_dropout_p": 0.7,
+    "layer1_dropout_p": 0.0,
     "layer1_dropout_channel_ratio": 0.3,
     "layer1_dropout_hf_ratio": 0.35,
     "layer1_dropout_eot_samples": 1,
     "layer1_dropout_eot_reduction": "logits",
-}
-ARCHITECTURE_ARGUMENT_DEFAULTS = {
-    "architecture_mode": "simple",
-    "egs_tsaa_tk": 0.6,
-    "egs_tsaa_stage1_lam2": 0.00001,
-    "egs_tsaa_stage2_start_epoch": -1,
-    "egs_tsaa_stage2_lam2": 0.0003,
-    "egs_tsaa_smooth_loss": "soft",
 }
 
 # These fields change the optimization trajectory or the data presented to the
@@ -146,10 +125,13 @@ ARCHITECTURE_ARGUMENT_DEFAULTS = {
 # save_every, num_workers, and worker timeout may change.
 RESUME_EXACT_ARGS = (
     "train_dir",
+    "train_csv",
     "model_type",
+    "generator_mode",
     "eps",
     "target",
     "batch_size",
+    "max_batches_per_epoch",
     "sample_per_class",
     "n_iters",
     "lr",
@@ -159,11 +141,9 @@ RESUME_EXACT_ARGS = (
     "pb",
     "seed",
     "device",
-    *ARCHITECTURE_ARGUMENT_DEFAULTS,
     "decoder_width",
     "decoder_num_blocks",
     "decoder_upsample_backend",
-    "decoder_mode",
     *LAYER1_DROPOUT_DEFAULTS,
     "ddsc_target_density",
     "ddsc_warmup_epochs",
@@ -175,6 +155,89 @@ RESUME_EXACT_ARGS = (
     "ddsc_lambda1_min",
     "ddsc_lambda1_max",
 )
+
+
+def generator_type_for_mode(generator_mode: str) -> str:
+    try:
+        return GENERATOR_TYPES_BY_MODE[generator_mode]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported generator_mode: {generator_mode!r}"
+        ) from exc
+
+
+def generator_mode_for_type(generator_type: str) -> str:
+    matches = [
+        mode
+        for mode, candidate_type in GENERATOR_TYPES_BY_MODE.items()
+        if generator_type == candidate_type
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"unsupported generator_type: {generator_type!r}")
+    return matches[0]
+
+
+def _legacy_feature_guidance_contract(
+    architecture: Mapping[str, Any],
+) -> str:
+    """Classify legacy metadata without trusting it for state reconstruction."""
+
+    encoder = architecture.get("encoder")
+    if not isinstance(encoder, Mapping):
+        return "invalid"
+    gradient_branch = encoder.get("gradient_branch")
+    feature_guidance = architecture.get("legacy_feature_guidance")
+    if isinstance(gradient_branch, Mapping):
+        if (
+            gradient_branch.get("present") is True
+            and gradient_branch.get("frozen") is False
+            and gradient_branch.get("used_by_ddsc") is True
+            and feature_guidance == "enabled_trainable_by_ddsc"
+        ):
+            return "trainable"
+        if (
+            gradient_branch.get("present") is True
+            and gradient_branch.get("frozen") is True
+            and gradient_branch.get("used_by_ddsc") is False
+            and feature_guidance == "preserved_frozen_unused_by_ddsc"
+        ):
+            return "frozen_unused"
+    if (
+        gradient_branch is True
+        and feature_guidance == "available_but_unused_by_ddsc"
+    ):
+        return "unversioned_unused"
+    return "invalid"
+
+
+def _legacy_inference_architecture_matches_current(
+    architecture: Mapping[str, Any],
+    current_architecture: Mapping[str, Any],
+) -> bool:
+    """Allow only the historical feature-guidance metadata difference."""
+
+    if _legacy_feature_guidance_contract(architecture) not in {
+        "frozen_unused",
+        "unversioned_unused",
+    }:
+        return False
+    encoder = architecture.get("encoder")
+    current_encoder = current_architecture.get("encoder")
+    if not isinstance(encoder, Mapping) or not isinstance(
+        current_encoder,
+        Mapping,
+    ):
+        return False
+    normalized_architecture = dict(architecture)
+    normalized_encoder = dict(encoder)
+    normalized_encoder["gradient_branch"] = current_encoder.get(
+        "gradient_branch"
+    )
+    normalized_architecture["encoder"] = normalized_encoder
+    normalized_architecture["legacy_feature_guidance"] = (
+        current_architecture.get("legacy_feature_guidance")
+    )
+    return _values_equal_exact(normalized_architecture, current_architecture)
 
 
 @dataclass(frozen=True)
@@ -458,14 +521,22 @@ def load_controller_state(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train isolated DDSC-GPG with dynamic lambda-1 and a frozen "
-            "ResNet-50 layer1 encoder"
+            "Train DDSC-GPG with dynamic lambda-1 using a selectable legacy "
+            "or isolated generator"
         )
     )
     parser.add_argument(
         "--train_dir",
         default="/home/dataset/imagenet-1k/train",
-        help="path to the ImageNet training set",
+        help="path to an ImageFolder root or the NIPS2017 image directory",
+    )
+    parser.add_argument(
+        "--train_csv",
+        default="",
+        help=(
+            "optional NIPS2017 images.csv; when set, TrueLabel is read from "
+            "the CSV instead of inferring labels from ImageFolder directories"
+        ),
     )
     parser.add_argument(
         "--model_type",
@@ -474,14 +545,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="attack surrogate model",
     )
     parser.add_argument(
-        "--architecture_mode",
-        "--architecture-mode",
-        dest="architecture_mode",
-        choices=("simple", "gpg", "tsaa", "egs_tsaa", "egs_tssa"),
-        default=ARCHITECTURE_ARGUMENT_DEFAULTS["architecture_mode"],
+        "--generator_mode",
+        "--generator-mode",
+        dest="generator_mode",
+        choices=GENERATOR_MODES,
+        default="isolated",
         help=(
-            "generator/loss family; egs_tssa is an alias for the requested "
-            "egs_tsaa mode backed by third_party/EGS-TSSA"
+            "isolated uses the frozen ResNet-50 layer1 shared-lite generator; "
+            "isolated_split shares the adapter/residual body and learns "
+            "independent perturbation and mask upsampling trunks; "
+            "legacy uses the original learned dual-encoder GPG generator"
         ),
     )
     parser.add_argument(
@@ -550,6 +623,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum samples per class; 0 uses all samples",
     )
     parser.add_argument("--n_iters", type=int, default=1)
+    parser.add_argument(
+        "--max_batches_per_epoch",
+        type=int,
+        default=0,
+        help="maximum training batches per epoch; 0 processes the full loader",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=2.25e-5)
     parser.add_argument(
@@ -591,69 +670,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--decoder_width", type=int, default=128)
-    parser.add_argument("--decoder_num_blocks", type=int, default=3)
+    parser.add_argument(
+        "--decoder_width",
+        type=int,
+        default=ISOLATED_DECODER_DEFAULTS["decoder_width"],
+    )
+    parser.add_argument(
+        "--decoder_num_blocks",
+        type=int,
+        default=ISOLATED_DECODER_DEFAULTS["decoder_num_blocks"],
+    )
     parser.add_argument(
         "--decoder_upsample_backend",
         choices=("transpose", "nearest_conv"),
-        default="transpose",
-        help="upsampling backend; transpose matches the frozen-SPGD default",
-    )
-    parser.add_argument(
-        "--decoder_mode",
-        "--decoder-mode",
-        dest="decoder_mode",
-        choices=("shared", "split"),
-        default="shared",
-        help=(
-            "share both upsampling stages or use independent perturbation and "
-            "mask branches after the common residual trunk"
-        ),
-    )
-    parser.add_argument(
-        "--egs_tsaa_tk",
-        "--egs-tssa-tk",
-        "--egs_tssa_tk",
-        dest="egs_tsaa_tk",
-        type=float,
-        default=ARCHITECTURE_ARGUMENT_DEFAULTS["egs_tsaa_tk"],
-        help="EGS-TSSA fraction of non-overlapping CAM boxes retained",
-    )
-    parser.add_argument(
-        "--egs_tsaa_stage1_lam2",
-        "--egs-tssa-stage1-lam2",
-        "--egs_tssa_stage1_lam2",
-        dest="egs_tsaa_stage1_lam2",
-        type=float,
-        default=ARCHITECTURE_ARGUMENT_DEFAULTS["egs_tsaa_stage1_lam2"],
-        help="original EGS-TSSA stage-I quantization coefficient",
-    )
-    parser.add_argument(
-        "--egs_tsaa_stage2_start_epoch",
-        "--egs-tssa-stage2-start-epoch",
-        "--egs_tssa_stage2_start_epoch",
-        dest="egs_tsaa_stage2_start_epoch",
-        type=int,
-        default=ARCHITECTURE_ARGUMENT_DEFAULTS["egs_tsaa_stage2_start_epoch"],
-        help="enable the original local EGS-TSSA stage-II lambda2; -1 disables",
-    )
-    parser.add_argument(
-        "--egs_tsaa_stage2_lam2",
-        "--egs-tssa-stage2-lam2",
-        "--egs_tssa_stage2_lam2",
-        dest="egs_tsaa_stage2_lam2",
-        type=float,
-        default=ARCHITECTURE_ARGUMENT_DEFAULTS["egs_tsaa_stage2_lam2"],
-        help="original local EGS-TSSA stage-II quantization coefficient",
-    )
-    parser.add_argument(
-        "--egs_tsaa_smooth_loss",
-        "--egs-tssa-smooth-loss",
-        "--egs_tssa_smooth_loss",
-        dest="egs_tsaa_smooth_loss",
-        choices=("soft", "hard"),
-        default=ARCHITECTURE_ARGUMENT_DEFAULTS["egs_tsaa_smooth_loss"],
-        help="original local EGS-TSSA structured quantization formula",
+        default=ISOLATED_DECODER_DEFAULTS["decoder_upsample_backend"],
+        help="shared-lite backend; transpose matches the frozen-SPGD default",
     )
     parser.add_argument("--save_every", type=int, default=1)
 
@@ -670,7 +701,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ddsc-warmup-epochs",
         dest="ddsc_warmup_epochs",
         type=int,
-        default=2,
+        default=1,
         help="GPG-compatible epochs with lambda-1 fixed at zero",
     )
     parser.add_argument("--ddsc_ema_decay", type=float, default=0.0)
@@ -689,7 +720,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    args.architecture_mode = canonical_architecture_mode(args.architecture_mode)
     if torch.get_default_dtype() != torch.float32:
         raise ValueError(
             "DDSC-GPG training requires the torch default dtype to be float32"
@@ -720,10 +750,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "exact DDSC continuation currently supports only CPU and CUDA"
         )
-    if args.architecture_mode in {"tsaa", "egs_tsaa"} and device_type != "cuda":
-        raise ValueError(
-            "the unmodified TSAA/EGS-TSSA source training generators require CUDA"
-        )
     positive = {
         "eps": args.eps,
         "batch_size": args.batch_size,
@@ -737,14 +763,29 @@ def validate_args(args: argparse.Namespace) -> None:
     for name, value in positive.items():
         if not math.isfinite(float(value)) or value <= 0:
             raise ValueError(f"--{name} must be finite and positive")
-    if args.sample_per_class < 0 or args.num_workers < 0:
-        raise ValueError("sample_per_class and num_workers must be non-negative")
+    if (
+        args.sample_per_class < 0
+        or args.max_batches_per_epoch < 0
+        or args.num_workers < 0
+    ):
+        raise ValueError(
+            "sample_per_class, max_batches_per_epoch, and num_workers "
+            "must be non-negative"
+        )
     if args.decoder_num_blocks < 0:
         raise ValueError("decoder_num_blocks must be non-negative")
-    if args.architecture_mode != "simple" and args.decoder_mode != "shared":
-        raise ValueError(
-            "decoder_mode is configurable only for architecture_mode simple"
-        )
+    if args.generator_mode == "legacy":
+        changed_decoder_options = {
+            name: getattr(args, name)
+            for name, default in ISOLATED_DECODER_DEFAULTS.items()
+            if getattr(args, name) != default
+        }
+        if changed_decoder_options:
+            raise ValueError(
+                "decoder_width/decoder_num_blocks/decoder_upsample_backend "
+                "configure only the isolated generators; legacy mode requires "
+                f"their defaults, got {changed_decoder_options}"
+            )
     if args.ddsc_warmup_epochs < 0:
         raise ValueError("ddsc_warmup_epochs must be non-negative")
     if not 0.0 < args.ddsc_target_density <= 1.0:
@@ -764,70 +805,17 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 "layer1_dropout_p must be positive when layer1 dropout is enabled"
             )
-        if (
-            args.architecture_mode != "simple"
-            and args.layer1_dropout_eot_reduction != "loss"
-        ):
-            raise ValueError(
-                "gpg/tsaa/egs_tsaa require layer1_dropout_eot_reduction=loss "
-                "so each EOT member retains the source CW objective"
-            )
     for name in ("layer1_dropout_channel_ratio", "layer1_dropout_hf_ratio"):
         value = getattr(args, name)
         if not math.isfinite(value) or not 0.0 < value <= 1.0:
             raise ValueError(f"{name} must be finite and in (0, 1]")
     if args.layer1_dropout_eot_samples <= 0:
         raise ValueError("layer1_dropout_eot_samples must be positive")
-    loss_multipliers = (
-        args.lam_1,
-        args.lam_2,
-        args.lam_3,
-        args.egs_tsaa_stage1_lam2,
-        args.egs_tsaa_stage2_lam2,
-    )
+    loss_multipliers = (args.lam_1, args.lam_2, args.lam_3)
     if not all(math.isfinite(value) and value >= 0.0 for value in loss_multipliers):
         raise ValueError("loss multipliers must be finite and non-negative")
-    if not math.isfinite(args.egs_tsaa_tk) or not 0.0 < args.egs_tsaa_tk <= 1.0:
-        raise ValueError("egs_tsaa_tk must be finite and in (0, 1]")
-    if args.egs_tsaa_stage2_start_epoch < -1:
-        raise ValueError("egs_tsaa_stage2_start_epoch must be -1 or non-negative")
-    if args.architecture_mode == "egs_tsaa":
-        image_size = 299 if args.model_type == "incv3" else 224
-        filter_size = 13 if args.model_type == "incv3" else 8
-        box_count = ((image_size - filter_size) // filter_size + 1) ** 2
-        selected_boxes = min(
-            int(((image_size / filter_size) ** 2) * args.egs_tsaa_tk),
-            box_count,
-        )
-        maximum_density = selected_boxes / float(box_count)
-        if args.ddsc_target_density > maximum_density:
-            raise ValueError(
-                "ddsc_target_density exceeds the EGS-TSSA structured-mask "
-                f"maximum density {maximum_density:.9g}"
-            )
     if args.load_CP == "Continue" and not args.CP_path:
         raise ValueError("--CP_path is required when --load_CP Continue")
-
-
-def resolve_training_device(device_text: str) -> torch.device:
-    """Resolve CUDA to a concrete, available logical device index."""
-
-    try:
-        device = torch.device(device_text)
-    except (RuntimeError, ValueError) as exc:
-        raise ValueError(f"--device is invalid: {device_text!r}") from exc
-    if device.type != "cuda":
-        return device
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is not available")
-    index = torch.cuda.current_device() if device.index is None else device.index
-    device_count = torch.cuda.device_count()
-    if index < 0 or index >= device_count:
-        raise ValueError(
-            "CUDA device index is unavailable: "
-            f"requested={index}, device_count={device_count}"
-        )
-    return torch.device("cuda", index)
 
 
 def controller_config_from_args(args: argparse.Namespace) -> DDSCControllerConfig:
@@ -859,58 +847,36 @@ def _normalize_checkpoint_train_args(
     *,
     checkpoint_format: str,
 ) -> dict[str, Any]:
-    """Validate v9/v8 args or explicitly migrate simple-mode v7/v6 checkpoints."""
+    """Normalize supported checkpoints into the current v8 argument schema."""
 
     if not isinstance(stored_args, Mapping):
         raise ValueError("checkpoint train_args must be a mapping")
     normalized = dict(stored_args)
-    # Checkpoints written before decoder topology became configurable used the
-    # shared decoder exclusively.  Preserve exact continuation for those runs.
-    normalized.setdefault("decoder_mode", "shared")
+    normalized.setdefault("max_batches_per_epoch", 0)
     dropout_keys = set(LAYER1_DROPOUT_DEFAULTS)
-    architecture_keys = set(ARCHITECTURE_ARGUMENT_DEFAULTS)
     present = dropout_keys.intersection(normalized)
-    architecture_present = architecture_keys.intersection(normalized)
-    if checkpoint_format in {
-        CHECKPOINT_FORMAT,
-        PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
-    }:
+    if checkpoint_format == CHECKPOINT_FORMAT:
         if present != dropout_keys:
             missing = sorted(dropout_keys - present)
             raise ValueError(
-                f"{checkpoint_format} layer1-dropout arguments are incomplete: "
+                "v8 checkpoint layer1-dropout arguments are incomplete: "
                 f"missing={missing}"
             )
-        if architecture_present != architecture_keys:
-            missing = sorted(architecture_keys - architecture_present)
-            raise ValueError(
-                f"{checkpoint_format} architecture arguments are incomplete: "
-                f"missing={missing}"
-            )
-        normalized["architecture_mode"] = canonical_architecture_mode(
-            normalized["architecture_mode"]
-        )
+        if "generator_mode" not in normalized:
+            raise ValueError("v8 checkpoint generator_mode is missing")
+        generator_type_for_mode(normalized["generator_mode"])
         return normalized
-    if checkpoint_format == LAYER1_DROPOUT_TRAINING_CHECKPOINT_FORMAT:
+    if checkpoint_format == DROPOUT_TRAINING_CHECKPOINT_FORMAT:
         if present != dropout_keys:
             missing = sorted(dropout_keys - present)
             raise ValueError(
                 "v7 checkpoint layer1-dropout arguments are incomplete: "
                 f"missing={missing}"
             )
-        if architecture_present and architecture_present != architecture_keys:
-            missing = sorted(architecture_keys - architecture_present)
-            raise ValueError(
-                "v7 checkpoint architecture arguments are partial: "
-                f"missing={missing}"
-            )
-        if not architecture_present:
-            normalized.update(ARCHITECTURE_ARGUMENT_DEFAULTS)
-        normalized["architecture_mode"] = canonical_architecture_mode(
-            normalized["architecture_mode"]
-        )
-        if normalized["architecture_mode"] != "simple":
-            raise ValueError("v7 checkpoints can contain only architecture_mode simple")
+        if "generator_mode" in normalized:
+            raise ValueError("v7 checkpoint must not contain generator_mode")
+        normalized.setdefault("train_csv", "")
+        normalized["generator_mode"] = "isolated"
         return normalized
     if checkpoint_format == LEGACY_TRAINING_CHECKPOINT_FORMAT:
         if present:
@@ -918,20 +884,11 @@ def _normalize_checkpoint_train_args(
                 "legacy v6 checkpoints must not contain layer1-dropout "
                 f"arguments: present={sorted(present)}"
             )
+        if "generator_mode" in normalized:
+            raise ValueError("legacy v6 checkpoint must not contain generator_mode")
         normalized.update(LAYER1_DROPOUT_DEFAULTS)
-        if architecture_present and architecture_present != architecture_keys:
-            missing = sorted(architecture_keys - architecture_present)
-            raise ValueError(
-                "legacy v6 checkpoint architecture arguments are partial: "
-                f"missing={missing}"
-            )
-        if not architecture_present:
-            normalized.update(ARCHITECTURE_ARGUMENT_DEFAULTS)
-        normalized["architecture_mode"] = canonical_architecture_mode(
-            normalized["architecture_mode"]
-        )
-        if normalized["architecture_mode"] != "simple":
-            raise ValueError("legacy v6 checkpoints can contain only simple mode")
+        normalized.setdefault("train_csv", "")
+        normalized["generator_mode"] = "isolated"
         return normalized
     raise ValueError(f"unsupported training checkpoint format: {checkpoint_format!r}")
 
@@ -942,6 +899,8 @@ def experiment_fingerprint(
 ) -> str:
     contract = {key: getattr(args, key) for key in RESUME_EXACT_ARGS}
     contract["train_dir"] = str(Path(args.train_dir).expanduser().resolve())
+    if args.train_csv:
+        contract["train_csv"] = str(Path(args.train_csv).expanduser().resolve())
     contract["controller_config"] = asdict(controller_config)
     canonical = json.dumps(
         contract,
@@ -1339,59 +1298,6 @@ def cw_loss(
     return torch.clamp(margin, min=float(kappa)).sum()
 
 
-def assemble_mode_loss(
-    architecture_mode: str,
-    *,
-    adversarial_loss: torch.Tensor,
-    sparse_loss: torch.Tensor,
-    quantization_loss_value: torch.Tensor,
-    lambda1: float,
-    lambda2: float,
-    lambda3: float,
-    adv_inf: torch.Tensor | None = None,
-    pgd_delta: torch.Tensor | None = None,
-    feature_guidance: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assemble the production mode loss while substituting only lambda-1.
-
-    The helper keeps the source methods' sum reductions outside this function
-    and makes the presence or absence of guidance terms fail closed.  Returning
-    the weighted guidance term separately preserves the existing diagnostics.
-    """
-
-    mode = canonical_architecture_mode(architecture_mode)
-    for name, value in (
-        ("lambda1", lambda1),
-        ("lambda2", lambda2),
-        ("lambda3", lambda3),
-    ):
-        if not math.isfinite(float(value)):
-            raise ValueError(f"{name} must be finite")
-
-    guidance = adversarial_loss.new_zeros(())
-    if mode in {"simple", "gpg"}:
-        if adv_inf is None or pgd_delta is None:
-            raise ValueError(f"{mode} loss requires PGD pixel guidance tensors")
-        guidance = float(lambda3) * torch.sum((adv_inf - pgd_delta) ** 2)
-    elif adv_inf is not None or pgd_delta is not None:
-        raise ValueError(f"{mode} loss must not receive PGD guidance tensors")
-
-    if mode == "gpg":
-        if feature_guidance is None:
-            raise ValueError("gpg loss requires generator feature guidance")
-        guidance = guidance + float(lambda3) * feature_guidance
-    elif feature_guidance is not None:
-        raise ValueError(f"{mode} loss must not receive feature guidance")
-
-    total = (
-        adversarial_loss
-        + float(lambda1) * sparse_loss
-        + float(lambda2) * quantization_loss_value
-        + guidance
-    )
-    return total, guidance
-
-
 def attack_pgd(
     model: torch.nn.Module,
     image: torch.Tensor,
@@ -1444,14 +1350,81 @@ def build_encoder_backbone(
     return torchvision.models.resnet50(weights=weights)
 
 
+class NIPS2017Dataset(torch.utils.data.Dataset):
+    """NIPS2017 images with the official one-based ImageNet labels."""
+
+    def __init__(
+        self,
+        image_root: str | os.PathLike[str],
+        csv_path: str | os.PathLike[str],
+        transform: transforms.Compose,
+    ) -> None:
+        self.root = str(Path(image_root).expanduser().resolve())
+        self.csv_path = str(Path(csv_path).expanduser().resolve())
+        self.transform = transform
+        self.samples: list[tuple[str, int]] = []
+        self.targets: list[int] = []
+
+        required_columns = {"ImageId", "TrueLabel"}
+        with Path(self.csv_path).open(
+            "r", encoding="utf-8-sig", newline=""
+        ) as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None or not required_columns.issubset(
+                reader.fieldnames
+            ):
+                raise ValueError(
+                    "NIPS2017 CSV must contain ImageId and TrueLabel columns"
+                )
+            for row_number, row in enumerate(reader, start=2):
+                image_id = (row.get("ImageId") or "").strip()
+                if not image_id:
+                    raise ValueError(
+                        f"NIPS2017 CSV row {row_number} has no ImageId"
+                    )
+                try:
+                    label = int(row["TrueLabel"]) - 1
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"NIPS2017 CSV row {row_number} has an invalid TrueLabel"
+                    ) from exc
+                if not 0 <= label < 1000:
+                    raise ValueError(
+                        f"NIPS2017 CSV row {row_number} TrueLabel is outside [1, 1000]"
+                    )
+                image_path = Path(self.root) / f"{image_id}.png"
+                if not image_path.is_file():
+                    raise FileNotFoundError(
+                        f"NIPS2017 image listed in CSV is missing: {image_path}"
+                    )
+                self.samples.append((str(image_path), label))
+                self.targets.append(label)
+        if not self.samples:
+            raise ValueError("NIPS2017 CSV does not contain any samples")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        image_path, label = self.samples[index]
+        with Image.open(image_path) as image:
+            sample = self.transform(image.convert("RGB"))
+        return sample, label
+
+
 def build_train_set(
     train_dir: str,
     transform: transforms.Compose,
     *,
+    train_csv: str = "",
     sample_per_class: int,
     seed: int,
-) -> datasets.ImageFolder | Subset:
-    train_set = datasets.ImageFolder(train_dir, transform)
+) -> datasets.ImageFolder | NIPS2017Dataset | Subset:
+    train_set: datasets.ImageFolder | NIPS2017Dataset
+    if train_csv:
+        train_set = NIPS2017Dataset(train_dir, train_csv, transform)
+    else:
+        train_set = datasets.ImageFolder(train_dir, transform)
     if sample_per_class <= 0:
         return train_set
 
@@ -1584,7 +1557,7 @@ def _iter_training_batches(
 
 
 def dataset_contract(
-    train_set: datasets.ImageFolder | Subset,
+    train_set: datasets.ImageFolder | NIPS2017Dataset | Subset,
 ) -> dict[str, Any]:
     """Fingerprint the ordered path/label manifest used by this run.
 
@@ -1599,8 +1572,10 @@ def dataset_contract(
     else:
         base_dataset = train_set
         sample_indices = range(len(train_set))
-    if not isinstance(base_dataset, datasets.ImageFolder):
-        raise TypeError("dataset_contract requires an ImageFolder or its Subset")
+    if not isinstance(base_dataset, (datasets.ImageFolder, NIPS2017Dataset)):
+        raise TypeError(
+            "dataset_contract requires an ImageFolder, NIPS2017Dataset, or Subset"
+        )
 
     root = Path(base_dataset.root)
     digest = hashlib.sha256()
@@ -1794,72 +1769,6 @@ def validate_attack_model_contract(
         )
 
 
-def _validate_egs_checkpoint_conditioner_cross_fields(
-    conditioner_contract: Mapping[str, Any],
-    *,
-    architecture: Mapping[str, Any],
-    model_type: str,
-    image_size: int,
-    classifier_contract: Mapping[str, Any] | None,
-    checkpoint_kind: str,
-) -> None:
-    """Bind EGS provenance to the checkpoint fields that drive inference/training."""
-
-    if not isinstance(conditioner_contract, Mapping):
-        raise ValueError(
-            f"EGS-TSSA {checkpoint_kind} checkpoint lacks conditioner_contract"
-        )
-    egs_tk = architecture.get("egs_tk")
-    if (
-        type(egs_tk) is not float
-        or not math.isfinite(egs_tk)
-        or not 0.0 < egs_tk <= 1.0
-    ):
-        raise ValueError(
-            f"EGS-TSSA {checkpoint_kind} architecture.egs_tk is invalid"
-        )
-    if not _values_equal_exact(conditioner_contract.get("model_type"), model_type):
-        raise ValueError(
-            f"EGS-TSSA {checkpoint_kind} conditioner model_type differs from checkpoint"
-        )
-    if not _values_equal_exact(conditioner_contract.get("image_size"), image_size):
-        raise ValueError(
-            f"EGS-TSSA {checkpoint_kind} conditioner image_size differs from checkpoint"
-        )
-    if not _values_equal_exact(
-        conditioner_contract.get("topk_fraction"),
-        egs_tk,
-    ):
-        raise ValueError(
-            f"EGS-TSSA {checkpoint_kind} conditioner topk_fraction differs from "
-            "architecture.egs_tk"
-        )
-    nested_classifier_contract = conditioner_contract.get("attack_model_contract")
-    if not isinstance(nested_classifier_contract, Mapping):
-        raise ValueError(
-            f"EGS-TSSA {checkpoint_kind} conditioner classifier contract is invalid"
-        )
-    validate_attack_model_contract(
-        nested_classifier_contract,
-        expected_model_type=model_type,
-        actual_contract=classifier_contract,
-    )
-    expected_conditioner_contract = egs_conditioner_contract(
-        model_type=model_type,
-        image_size=image_size,
-        topk_fraction=egs_tk,
-        attack_model_contract=(
-            nested_classifier_contract
-            if classifier_contract is None
-            else classifier_contract
-        ),
-    )
-    validate_egs_conditioner_contract(
-        conditioner_contract,
-        actual_contract=expected_conditioner_contract,
-    )
-
-
 def _load_checkpoint_envelope(
     path: str | os.PathLike[str],
     *,
@@ -1980,12 +1889,11 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         path,
         expected_formats=(
             CHECKPOINT_FORMAT,
-            PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
-            LAYER1_DROPOUT_TRAINING_CHECKPOINT_FORMAT,
+            DROPOUT_TRAINING_CHECKPOINT_FORMAT,
             LEGACY_TRAINING_CHECKPOINT_FORMAT,
         ),
     )
-    legacy_required = {
+    required = {
         "kind",
         "checkpoint_boundary",
         "generator_type",
@@ -2003,9 +1911,6 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         "dataset_contract",
         "runtime_contract",
     }
-    required = set(legacy_required)
-    if checkpoint_format == CHECKPOINT_FORMAT:
-        required.add("conditioner_contract")
     if set(payload) != required:
         raise ValueError(
             "training checkpoint keys mismatch: "
@@ -2016,8 +1921,6 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         raise ValueError("checkpoint kind is not training")
     if payload["checkpoint_boundary"] != "post_epoch_post_controller_update":
         raise ValueError("unsupported training checkpoint boundary")
-    if payload["generator_type"] not in SUPPORTED_GENERATOR_TYPES:
-        raise ValueError("checkpoint generator_type is incompatible")
     completed_epoch = _require_plain_int(
         payload["completed_epoch"], "completed_epoch"
     )
@@ -2044,6 +1947,26 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         payload["train_args"],
         checkpoint_format=checkpoint_format,
     )
+    expected_generator_type = generator_type_for_mode(
+        payload["train_args"]["generator_mode"]
+    )
+    if payload["generator_type"] != expected_generator_type:
+        raise ValueError(
+            "checkpoint generator_type is inconsistent with generator_mode"
+        )
+    if payload["architecture"].get("generator_type") != expected_generator_type:
+        raise ValueError(
+            "checkpoint architecture generator_type is inconsistent"
+        )
+    if (
+        payload["train_args"]["generator_mode"] == "legacy"
+        and _legacy_feature_guidance_contract(payload["architecture"])
+        != "trainable"
+    ):
+        raise ValueError(
+            "legacy training checkpoint does not use trainable feature guidance; "
+            "restart legacy training under the current objective"
+        )
     required_train_args = set(RESUME_EXACT_ARGS) | {"epochs"}
     missing_train_args = required_train_args - set(payload["train_args"])
     if missing_train_args:
@@ -2051,15 +1974,6 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
             "training checkpoint train_args is incomplete: "
             f"missing={sorted(missing_train_args)}"
         )
-    try:
-        expected_generator_type = generator_type_for_architecture_mode(
-            payload["train_args"]["architecture_mode"],
-            payload["train_args"]["decoder_mode"],
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("training checkpoint architecture/decoder mode is invalid") from exc
-    if payload["generator_type"] != expected_generator_type:
-        raise ValueError("training checkpoint generator_type and decoder_mode disagree")
     validate_module_state_dict_finite(
         payload["generator_state_dict"],
         field_name="generator_state_dict",
@@ -2068,38 +1982,6 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         payload["attack_model_contract"],
         expected_model_type=payload["train_args"]["model_type"],
     )
-    architecture_mode = payload["train_args"]["architecture_mode"]
-    if checkpoint_format != CHECKPOINT_FORMAT:
-        if architecture_mode == "egs_tsaa":
-            raise ValueError(
-                "legacy EGS-TSSA training checkpoint lacks the required "
-                "classifier/conditioner contract"
-            )
-        payload["conditioner_contract"] = None
-    conditioner_contract = payload["conditioner_contract"]
-    if architecture_mode == "egs_tsaa":
-        if not _values_equal_exact(
-            payload["architecture"].get("egs_tk"),
-            payload["train_args"]["egs_tsaa_tk"],
-        ):
-            raise ValueError(
-                "EGS-TSSA training architecture.egs_tk differs from "
-                "train_args.egs_tsaa_tk"
-            )
-        _validate_egs_checkpoint_conditioner_cross_fields(
-            conditioner_contract,
-            architecture=payload["architecture"],
-            model_type=payload["train_args"]["model_type"],
-            image_size=(
-                299 if payload["train_args"]["model_type"] == "incv3" else 224
-            ),
-            classifier_contract=payload["attack_model_contract"],
-            checkpoint_kind="training",
-        )
-    elif conditioner_contract is not None:
-        raise ValueError(
-            "non-EGS training checkpoint must not contain a conditioner contract"
-        )
     return payload
 
 
@@ -2110,10 +1992,10 @@ def load_inference_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]
         path,
         expected_formats=(
             INFERENCE_CHECKPOINT_FORMAT,
-            LEGACY_INFERENCE_CHECKPOINT_FORMAT,
+            PREVIOUS_INFERENCE_CHECKPOINT_FORMAT,
         ),
     )
-    legacy_required = {
+    required = {
         "kind",
         "generator_type",
         "model_type",
@@ -2124,9 +2006,6 @@ def load_inference_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]
         "architecture",
         "generator_state_dict",
     }
-    required = set(legacy_required)
-    if checkpoint_format == INFERENCE_CHECKPOINT_FORMAT:
-        required.add("conditioner_contract")
     if set(payload) != required:
         raise ValueError(
             "inference checkpoint keys mismatch: "
@@ -2135,8 +2014,12 @@ def load_inference_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]
         )
     if payload["kind"] != "inference":
         raise ValueError("checkpoint kind is not inference")
-    if payload["generator_type"] not in SUPPORTED_GENERATOR_TYPES:
-        raise ValueError("checkpoint generator_type is incompatible")
+    generator_mode = generator_mode_for_type(payload["generator_type"])
+    if (
+        checkpoint_format == PREVIOUS_INFERENCE_CHECKPOINT_FORMAT
+        and generator_mode != "isolated"
+    ):
+        raise ValueError("v2 inference checkpoints support only isolated mode")
     if payload["model_type"] not in {"res50", "incv3"}:
         raise ValueError("checkpoint model_type is unsupported")
     target = _require_plain_int(payload["target"], "target")
@@ -2160,35 +2043,23 @@ def load_inference_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]
         payload["generator_state_dict"], Mapping
     ):
         raise ValueError("inference architecture/state must be mappings")
+    if (
+        payload["architecture"].get("generator_type")
+        != payload["generator_type"]
+    ):
+        raise ValueError(
+            "inference architecture generator_type is inconsistent"
+        )
+    if (
+        generator_mode == "legacy"
+        and _legacy_feature_guidance_contract(payload["architecture"])
+        not in {"trainable", "frozen_unused", "unversioned_unused"}
+    ):
+        raise ValueError("legacy inference feature-guidance metadata is incompatible")
     validate_module_state_dict_finite(
         payload["generator_state_dict"],
         field_name="generator_state_dict",
     )
-    payload = dict(payload)
-    architecture_mode = architecture_mode_from_generator_type(
-        payload["generator_type"]
-    )
-    if checkpoint_format == LEGACY_INFERENCE_CHECKPOINT_FORMAT:
-        if architecture_mode == "egs_tsaa":
-            raise ValueError(
-                "legacy EGS-TSSA inference checkpoint lacks the required "
-                "classifier/conditioner contract"
-            )
-        payload["conditioner_contract"] = None
-    conditioner_contract = payload["conditioner_contract"]
-    if architecture_mode == "egs_tsaa":
-        _validate_egs_checkpoint_conditioner_cross_fields(
-            conditioner_contract,
-            architecture=payload["architecture"],
-            model_type=payload["model_type"],
-            image_size=payload["image_size"],
-            classifier_contract=None,
-            checkpoint_kind="inference",
-        )
-    elif conditioner_contract is not None:
-        raise ValueError(
-            "non-EGS inference checkpoint must not contain a conditioner contract"
-        )
     return payload
 
 
@@ -2199,63 +2070,14 @@ def build_generator_from_inference_checkpoint(
 
     payload = load_inference_checkpoint(path)
     architecture = payload["architecture"]
-    if architecture.get("generator_type") != payload["generator_type"]:
+    generator_type = payload["generator_type"]
+    generator_mode = generator_mode_for_type(generator_type)
+    if architecture.get("generator_type") != generator_type:
         raise ValueError("inference architecture generator_type is incompatible")
-    architecture_mode = architecture_mode_from_generator_type(
-        payload["generator_type"]
-    )
-    if architecture_mode != "simple":
-        if architecture.get("architecture_mode") != architecture_mode:
-            raise ValueError("inference architecture_mode is incompatible")
-        with torch.inference_mode(False):
-            with torch.random.fork_rng(devices=[]), torch.device("cpu"):
-                generator = build_original_generator(
-                    architecture_mode,
-                    inception=payload["model_type"] == "incv3",
-                    eps=float(payload["eps_pixels"]) / 255.0,
-                    inference=True,
-                ).float()
-                if architecture_mode == "egs_tsaa":
-                    egs_tk = architecture.get("egs_tk")
-                    if not isinstance(egs_tk, (int, float)) or isinstance(
-                        egs_tk, bool
-                    ):
-                        raise ValueError("inference EGS-TSSA tk metadata is invalid")
-                    if not math.isfinite(float(egs_tk)) or not 0.0 < float(
-                        egs_tk
-                    ) <= 1.0:
-                        raise ValueError("inference EGS-TSSA tk metadata is invalid")
-                    setattr(generator, "ddsc_egs_tk", float(egs_tk))
-            _validate_module_state_schema_exact(
-                payload["generator_state_dict"],
-                generator.state_dict(),
-                field_name="generator_state_dict",
-            )
-            generator.load_state_dict(payload["generator_state_dict"], strict=True)
-            validate_module_state_dict_finite(
-                generator.state_dict(),
-                field_name="loaded_generator_state_dict",
-            )
-            generator.eval()
-            if not _values_equal_exact(
-                generator_architecture_metadata(generator, architecture_mode),
-                architecture,
-            ):
-                raise ValueError(
-                    "reconstructed inference architecture does not match metadata"
-                )
-        return generator, payload
     encoder = architecture.get("encoder")
     decoder = architecture.get("decoder")
     if not isinstance(encoder, Mapping) or not isinstance(decoder, Mapping):
         raise ValueError("inference architecture is incomplete")
-    if (
-        encoder.get("architecture") != "resnet50"
-        or encoder.get("weights_enum") != "IMAGENET1K_V1"
-        or encoder.get("stage") != "layer1"
-        or encoder.get("frozen") is not True
-    ):
-        raise ValueError("inference encoder metadata is incompatible")
     expected_crop = (
         "legacy_remove_top_row_and_right_column"
         if payload["model_type"] == "incv3"
@@ -2263,33 +2085,55 @@ def build_generator_from_inference_checkpoint(
     )
     if architecture.get("crop_policy") != expected_crop:
         raise ValueError("inference crop policy is incompatible")
-    decoder_modes = {
-        "shared_lite": "shared",
-        "split_lite": "split",
-    }
-    decoder_mode = decoder_modes.get(decoder.get("variant"))
-    if decoder_mode is None:
-        raise ValueError("inference decoder variant is incompatible")
-    if payload["generator_type"] != generator_type_for_architecture_mode(
-        "simple", decoder_mode
-    ):
-        raise ValueError("inference generator_type and decoder variant disagree")
     # The scaffold is fully overwritten below.  Force CPU/float32 construction
     # so host default tensor settings cannot touch accelerator RNG or placement.
     with torch.inference_mode(False):
         with torch.random.fork_rng(devices=[]), torch.device("cpu"):
-            generator = DDSCGPGGenerator(
-                torchvision.models.resnet50(weights=None),
-                inception=payload["model_type"] == "incv3",
-                decoder_width=_require_plain_int(
-                    decoder.get("width"), "decoder.width"
-                ),
-                decoder_num_blocks=_require_plain_int(
-                    decoder.get("num_blocks"), "decoder.num_blocks"
-                ),
-                decoder_upsample_backend=str(decoder.get("upsample_backend")),
-                decoder_mode=decoder_mode,
-            ).float()
+            if generator_mode in {"isolated", "isolated_split"}:
+                if (
+                    encoder.get("architecture") != "resnet50"
+                    or encoder.get("weights_enum") != "IMAGENET1K_V1"
+                    or encoder.get("stage") != "layer1"
+                    or encoder.get("frozen") is not True
+                ):
+                    raise ValueError("inference encoder metadata is incompatible")
+                expected_variant = (
+                    "shared_lite"
+                    if generator_mode == "isolated"
+                    else "split_lite"
+                )
+                if decoder.get("variant") != expected_variant:
+                    raise ValueError("inference decoder variant is incompatible")
+                generator_class = (
+                    DDSCGPGGenerator
+                    if generator_mode == "isolated"
+                    else DDSCSplitGPGGenerator
+                )
+                generator = generator_class(
+                    torchvision.models.resnet50(weights=None),
+                    inception=payload["model_type"] == "incv3",
+                    decoder_width=_require_plain_int(
+                        decoder.get("width"), "decoder.width"
+                    ),
+                    decoder_num_blocks=_require_plain_int(
+                        decoder.get("num_blocks"), "decoder.num_blocks"
+                    ),
+                    decoder_upsample_backend=str(decoder.get("upsample_backend")),
+                ).float()
+            else:
+                if (
+                    encoder.get("variant") != "legacy_learned_dual"
+                    or encoder.get("frozen") is not False
+                    or decoder.get("variant") != "legacy_dual_head"
+                ):
+                    raise ValueError(
+                        "legacy inference architecture metadata is incompatible"
+                    )
+                generator = LegacyGPGGenerator(
+                    inception=payload["model_type"] == "incv3",
+                    eps=float(payload["eps_pixels"]) / 255.0,
+                    evaluate=True,
+                ).float()
         _validate_module_state_schema_exact(
             payload["generator_state_dict"],
             generator.state_dict(),
@@ -2301,10 +2145,18 @@ def build_generator_from_inference_checkpoint(
             field_name="loaded_generator_state_dict",
         )
         generator.eval()
-        if not _values_equal_exact(
+        architecture_matches = _values_equal_exact(
             generator.architecture_metadata(),
             architecture,
-        ):
+        )
+        legacy_inference_compatible = (
+            generator_mode == "legacy"
+            and _legacy_inference_architecture_matches_current(
+                architecture,
+                generator.architecture_metadata(),
+            )
+        )
+        if not architecture_matches and not legacy_inference_compatible:
             raise ValueError(
                 "reconstructed inference architecture does not match metadata"
             )
@@ -2323,9 +2175,9 @@ def validate_resume_metadata(
     for key in RESUME_EXACT_ARGS:
         stored_value = stored_args.get(key)
         requested_value = getattr(args, key)
-        if key == "train_dir":
+        if key in {"train_dir", "train_csv"} and requested_value:
             if not isinstance(stored_value, (str, os.PathLike)):
-                raise ValueError("resume train_dir must be path-like")
+                raise ValueError(f"resume {key} must be path-like")
             stored_value = str(Path(stored_value).expanduser().resolve())
             requested_value = str(Path(requested_value).expanduser().resolve())
         if not _values_equal_exact(stored_value, requested_value):
@@ -2392,6 +2244,7 @@ def validate_resume_metadata(
             next_epoch=next_epoch,
             dataset_manifest=payload["dataset_contract"],
             batch_size=args.batch_size,
+            max_batches_per_epoch=args.max_batches_per_epoch,
         ),
     )
 
@@ -2401,15 +2254,44 @@ def expected_optimizer_step(
     next_epoch: int,
     dataset_manifest: Mapping[str, Any],
     batch_size: int,
+    max_batches_per_epoch: int = 0,
 ) -> int:
     if type(next_epoch) is not int or next_epoch <= 0:
         raise ValueError("next_epoch must be a positive plain integer")
     if type(batch_size) is not int or batch_size <= 0:
         raise ValueError("batch_size must be a positive plain integer")
+    if type(max_batches_per_epoch) is not int or max_batches_per_epoch < 0:
+        raise ValueError(
+            "max_batches_per_epoch must be a non-negative plain integer"
+        )
     sample_count = dataset_manifest.get("sample_count")
     if type(sample_count) is not int or sample_count <= 0:
         raise ValueError("dataset sample_count must be a positive plain integer")
-    return next_epoch * math.ceil(sample_count / batch_size)
+    batches_per_epoch = math.ceil(sample_count / batch_size)
+    if max_batches_per_epoch > 0:
+        batches_per_epoch = min(batches_per_epoch, max_batches_per_epoch)
+    return next_epoch * batches_per_epoch
+
+
+def epoch_timing_metrics(
+    *,
+    elapsed_seconds: float,
+    processed_batches: int,
+    processed_samples: int,
+) -> dict[str, float]:
+    """Return stable epoch throughput metrics after synchronized training."""
+
+    if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0.0:
+        raise ValueError("elapsed_seconds must be finite and positive")
+    if type(processed_batches) is not int or processed_batches <= 0:
+        raise ValueError("processed_batches must be a positive plain integer")
+    if type(processed_samples) is not int or processed_samples <= 0:
+        raise ValueError("processed_samples must be a positive plain integer")
+    return {
+        "seconds": float(elapsed_seconds),
+        "batches_per_second": processed_batches / elapsed_seconds,
+        "images_per_second": processed_samples / elapsed_seconds,
+    }
 
 
 def expected_adam_group_options(expected_lr: float) -> dict[str, Any]:
@@ -2681,15 +2563,11 @@ def save_epoch_checkpoints(
     dataset_manifest: Mapping[str, Any],
     runtime_manifest: Mapping[str, Any],
 ) -> tuple[Path, Path]:
-    architecture_mode = canonical_architecture_mode(args.architecture_mode)
-    checkpoint_prefix = (
-        "DDSC_GPG" if architecture_mode == "simple" else f"DDSC_{architecture_mode}"
-    )
     inference_path = output_path / (
-        f"{checkpoint_prefix}_{args.model_type}_epoch_{epoch:04d}.inference.pth"
+        f"DDSC_GPG_{args.model_type}_epoch_{epoch:04d}.inference.pth"
     )
     training_path = output_path / (
-        f"{checkpoint_prefix}_{args.model_type}_epoch_{epoch:04d}.train.pth"
+        f"DDSC_GPG_{args.model_type}_epoch_{epoch:04d}.train.pth"
     )
     generator_state = net_g.state_dict()
     validate_module_state_dict_finite(
@@ -2700,15 +2578,13 @@ def save_epoch_checkpoints(
         attack_model_manifest,
         expected_model_type=args.model_type,
     )
-    architecture = generator_architecture_metadata(net_g, architecture_mode)
-    checkpoint_generator_type = getattr(
-        net_g,
-        "generator_type",
-        generator_type_for_architecture_mode(
-            architecture_mode,
-            args.decoder_mode,
-        ),
-    )
+    architecture = net_g.architecture_metadata()
+    generator_type = getattr(net_g, "generator_type", None)
+    generator_mode_for_type(generator_type)
+    if architecture.get("generator_type") != generator_type:
+        raise ValueError(
+            "generator architecture metadata does not match generator_type"
+        )
     optimizer_state = optimizer.state_dict()
     optimizer_spec = optimizer_spec_for_generator(
         net_g,
@@ -2722,6 +2598,7 @@ def save_epoch_checkpoints(
             next_epoch=epoch + 1,
             dataset_manifest=dataset_manifest,
             batch_size=args.batch_size,
+            max_batches_per_epoch=args.max_batches_per_epoch,
         ),
         expected_parameters=[
             (name, parameter)
@@ -2733,32 +2610,14 @@ def save_epoch_checkpoints(
         data_loader_generator,
         include_cuda=torch.device(args.device).type == "cuda",
     )
-    image_size = 299 if args.model_type == "incv3" else 224
-    conditioner_contract: Mapping[str, Any] | None = None
-    if architecture_mode == "egs_tsaa":
-        conditioner_contract = egs_conditioner_contract(
-            model_type=args.model_type,
-            image_size=image_size,
-            topk_fraction=float(args.egs_tsaa_tk),
-            attack_model_contract=attack_model_manifest,
-        )
-        _validate_egs_checkpoint_conditioner_cross_fields(
-            conditioner_contract,
-            architecture=architecture,
-            model_type=args.model_type,
-            image_size=image_size,
-            classifier_contract=attack_model_manifest,
-            checkpoint_kind="saved",
-        )
     training_payload = (
         CHECKPOINT_FORMAT,
         {
             "kind": "training",
             "checkpoint_boundary": "post_epoch_post_controller_update",
-            "generator_type": checkpoint_generator_type,
+            "generator_type": generator_type,
             "generator_state_dict": generator_state,
             "attack_model_contract": dict(attack_model_manifest),
-            "conditioner_contract": conditioner_contract,
             "optimizer_state_dict": optimizer_state,
             "optimizer_spec": optimizer_spec,
             "controller_config": asdict(controller_config),
@@ -2776,14 +2635,13 @@ def save_epoch_checkpoints(
         INFERENCE_CHECKPOINT_FORMAT,
         {
             "kind": "inference",
-            "generator_type": checkpoint_generator_type,
+            "generator_type": generator_type,
             "model_type": args.model_type,
             "target": args.target,
             "eps_pixels": args.eps,
-            "image_size": image_size,
+            "image_size": 299 if args.model_type == "incv3" else 224,
             "completed_epoch": epoch,
             "architecture": architecture,
-            "conditioner_contract": conditioner_contract,
             "generator_state_dict": generator_state,
         },
     )
@@ -2888,11 +2746,13 @@ def _claim_output_directory(output_path: Path) -> None:
 
 def _run_training_impl(args: argparse.Namespace) -> Path:
     validate_args(args)
-    device = resolve_training_device(args.device)
     controller_config = controller_config_from_args(args)
     seed_everything(args.seed)
     torch.set_num_threads(3)
 
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
     current_runtime_contract = runtime_contract(device)
 
     if args.model_type == "res50":
@@ -2909,19 +2769,23 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         validate_resume_metadata(resume_payload, args, controller_config)
         lineage_fingerprint = file_fingerprint(args.CP_path)
 
-    if args.architecture_mode == "simple":
-        architecture_label = (
-            f"resnet50_layer1_{args.decoder_mode}_lite_"
+    generator_descriptors = {
+        "isolated": (
+            f"isolated_resnet50_layer1_shared_lite_"
             f"{args.decoder_upsample_backend}"
-        )
-        run_prefix = "DDSC_GPG"
-    else:
-        architecture_label = f"source_{args.architecture_mode}"
-        run_prefix = f"DDSC_{args.architecture_mode}"
+        ),
+        "isolated_split": (
+            f"isolated_resnet50_layer1_split_lite_"
+            f"{args.decoder_upsample_backend}"
+        ),
+        "legacy": "legacy_dual_encoder",
+    }
+    generator_descriptor = generator_descriptors[args.generator_mode]
     output_name = (
-        f"{run_prefix}_{args.model_type}_tar_{args.target}_eps_{args.eps}_"
+        f"DDSC_GPG_{args.model_type}_tar_{args.target}_eps_{args.eps}_"
         f"Load_{args.load_CP}_lam1init_{args.lam_1}_targetdens_"
-        f"{args.ddsc_target_density}_{architecture_label}_cfg_{config_fingerprint}_"
+        f"{args.ddsc_target_density}_{generator_descriptor}_"
+        f"cfg_{config_fingerprint}_"
         f"from_{lineage_fingerprint}"
     )
     output_path = Path(args.out_dir) / output_name
@@ -2942,42 +2806,32 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             expected_model_type=args.model_type,
             actual_contract=current_attack_model_contract,
         )
-        if args.architecture_mode == "egs_tsaa":
-            live_conditioner_contract = egs_conditioner_contract(
-                model_type=args.model_type,
-                image_size=image_size,
-                topk_fraction=float(args.egs_tsaa_tk),
-                attack_model_contract=current_attack_model_contract,
-            )
-            validate_egs_conditioner_contract(
-                resume_payload["conditioner_contract"],
-                actual_contract=live_conditioner_contract,
-            )
-    if args.architecture_mode == "simple":
+    if args.generator_mode in {"isolated", "isolated_split"}:
         encoder_backbone = build_encoder_backbone(
             args.model_type,
             clean_attack_model,
             continuing=resume_payload is not None,
         )
-        net_g = DDSCGPGGenerator(
+        generator_class = (
+            DDSCGPGGenerator
+            if args.generator_mode == "isolated"
+            else DDSCSplitGPGGenerator
+        )
+        net_g: torch.nn.Module = generator_class(
             encoder_backbone,
             inception=args.model_type == "incv3",
             decoder_width=args.decoder_width,
             decoder_num_blocks=args.decoder_num_blocks,
             decoder_upsample_backend=args.decoder_upsample_backend,
-            decoder_mode=args.decoder_mode,
         )
         if encoder_backbone is not clean_attack_model:
             del encoder_backbone
     else:
-        net_g = build_original_generator(
-            args.architecture_mode,
+        net_g = LegacyGPGGenerator(
             inception=args.model_type == "incv3",
             eps=args.eps / 255.0,
-            inference=False,
+            evaluate=False,
         )
-        if args.architecture_mode == "egs_tsaa":
-            setattr(net_g, "ddsc_egs_tk", float(args.egs_tsaa_tk))
 
     clean_attack_model.requires_grad_(False)
     clean_attack_model.eval().to(device)
@@ -2987,16 +2841,8 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
     )
     attack_objective_model.eval()
     net_g.to(device)
-    egs_conditioner: EGSStructuredMask | None = None
-    if args.architecture_mode == "egs_tsaa":
-        egs_conditioner = EGSStructuredMask(
-            clean_attack_model,
-            model_type=args.model_type,
-            image_size=image_size,
-            topk_fraction=args.egs_tsaa_tk,
-        )
     optimizer = optim.Adam(
-        list(iter_generator_trainable_parameters(net_g, args.architecture_mode)),
+        list(net_g.trainable_parameters()),
         lr=args.lr,
         betas=(0.5, 0.999),
     )
@@ -3009,6 +2855,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             ),
             dataset_manifest=resume_payload["dataset_contract"],
             batch_size=args.batch_size,
+            max_batches_per_epoch=args.max_batches_per_epoch,
         )
         validate_optimizer_state_dict(
             resume_payload["optimizer_state_dict"],
@@ -3051,7 +2898,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             resume_payload["next_epoch"], "next_epoch"
         )
         if not _values_equal_exact(
-            generator_architecture_metadata(net_g, args.architecture_mode),
+            net_g.architecture_metadata(),
             resume_payload["architecture"],
         ):
             raise ValueError("restored generator architecture differs from checkpoint")
@@ -3074,6 +2921,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
     train_set = build_train_set(
         args.train_dir,
         data_transform,
+        train_csv=args.train_csv,
         sample_per_class=args.sample_per_class,
         seed=args.seed,
     )
@@ -3129,30 +2977,25 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             "lambda1 is saved but never applied in this run"
         )
     LOGGER.info(
-        "generator_type=%s trainable_params=%d total_params=%d "
+        "generator_mode=%s generator_type=%s trainable_params=%d total_params=%d "
         "legacy_trainable_params=%d trainable_reduction=%.4f",
-        getattr(
-            net_g,
-            "generator_type",
-            generator_type_for_architecture_mode(
-                args.architecture_mode, args.decoder_mode
-            ),
-        ),
+        args.generator_mode,
+        net_g.generator_type,
         trainable_parameters,
         total_generator_parameters,
         LEGACY_GPG_PARAMETER_COUNT,
         reduction,
     )
-    LOGGER.info(
-        "architecture_mode=%s loss_contract=%s",
-        args.architecture_mode,
-        {
-            "simple": "CW+sparse+quantization+PGD-pixel-guidance",
-            "gpg": "legacy-CW+sparse+quantization+PGD-pixel+feature-guidance",
-            "tsaa": "legacy-CW+sparse+quantization",
-            "egs_tsaa": "legacy-CW+sparse+structured-quantization",
-        }[args.architecture_mode],
-    )
+    if args.generator_mode in {"isolated", "isolated_split"}:
+        LOGGER.info(
+            "legacy feature guidance disabled: frozen feature distance has no "
+            "decoder gradient; pixel-space PGD guidance remains enabled"
+        )
+    else:
+        LOGGER.info(
+            "legacy dual-encoder generator selected; DDSC uses both pixel-space "
+            "PGD guidance and the original trainable feature-guidance branch"
+        )
     LOGGER.info(
         "attack_objective layer1_dropout_mode=%s p=%.6g channel_ratio=%.6g "
         "hf_ratio=%.6g stochastic_members=%d clean_members=1 "
@@ -3195,27 +3038,30 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         # Match the historical one-base-seed-per-epoch sampler transition while
         # the private worker generator handles persistent-worker seeding.
         _consume_epoch_base_seed(data_loader_generator)
+        epoch_batch_total = len(train_loader)
+        if args.max_batches_per_epoch > 0:
+            epoch_batch_total = min(
+                epoch_batch_total,
+                args.max_batches_per_epoch,
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        epoch_start_time = time.perf_counter()
         training_batches = _iter_training_batches(
             train_loader,
             num_workers=args.num_workers,
             worker_timeout_seconds=args.worker_timeout_seconds,
         )
+        limited_training_batches = islice(training_batches, epoch_batch_total)
+        processed_batches = 0
         for batch_index, (image, ground_truth) in enumerate(
-            tqdm(training_batches, total=len(train_loader))
+            tqdm(limited_training_batches, total=epoch_batch_total)
         ):
             image = image.to(device, non_blocking=True)
             ground_truth = ground_truth.to(device, non_blocking=True)
-            structured_mask: torch.Tensor | None = None
-            if args.architecture_mode == "egs_tsaa":
-                if egs_conditioner is None:
-                    raise RuntimeError("EGS-TSSA conditioner was not initialized")
-                clean_logits, structured_mask = egs_conditioner.clean_logits_and_mask(
-                    normalize_for_classifier(image)
-                )
-            else:
-                with torch.no_grad():
-                    clean_logits = clean_attack_model(normalize_for_classifier(image))
-            clean_prediction = clean_logits.argmax(dim=-1)
+            with torch.no_grad():
+                clean_logits = clean_attack_model(normalize_for_classifier(image))
+                clean_prediction = clean_logits.argmax(dim=-1)
             if args.target == -1:
                 attack_label = clean_prediction
                 reference_prediction = clean_prediction
@@ -3223,37 +3069,39 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 attack_label = torch.full_like(ground_truth, args.target)
                 reference_prediction = attack_label
 
-            grad_delta: torch.Tensor | None = None
-            if args.architecture_mode in {"simple", "gpg"}:
-                if args.pb == "half" and args.eps > 128:
-                    grad_eps = args.eps / 2.0
-                else:
-                    grad_eps = float(args.eps)
-                grad_alpha = grad_eps / args.n_iters
-                grad_delta = attack_pgd(
-                    attack_objective_model,
-                    image,
-                    ground_truth,
-                    eps=grad_eps / 255.0,
-                    alpha=grad_alpha / 255.0,
-                    n_iters=args.n_iters,
-                )
+            if args.pb == "half" and args.eps > 128:
+                grad_eps = args.eps / 2.0
+            else:
+                grad_eps = float(args.eps)
+            grad_alpha = grad_eps / args.n_iters
+            grad_delta = attack_pgd(
+                attack_objective_model,
+                image,
+                ground_truth,
+                eps=grad_eps / 255.0,
+                alpha=grad_alpha / 255.0,
+                n_iters=args.n_iters,
+            )
 
             net_g.train()
             optimizer.zero_grad(set_to_none=True)
-            adv, adv_inf, adv_0, adv_00, generator_aux = forward_generator_training(
-                net_g,
-                args.architecture_mode,
-                image,
-                args.eps / 255.0,
-                pgd_delta=grad_delta,
-                structured_mask=structured_mask,
-            )
-            objective_cw = cw_loss if args.architecture_mode == "simple" else legacy_cw_loss
+            if args.generator_mode == "legacy":
+                adv, adv_inf, adv_0, adv_00, feature_guidance_loss = net_g(
+                    image,
+                    args.eps / 255.0,
+                    image + grad_delta,
+                )
+            else:
+                adv, adv_inf, adv_0, adv_00 = net_g(
+                    image,
+                    args.eps / 255.0,
+                )
+                feature_guidance_loss = adv.new_zeros(())
+            grad_guided_loss = torch.sum((adv_inf - grad_delta) ** 2)
             loss_adv, adv_logits = attack_model_loss_and_logits(
                 attack_objective_model,
                 normalize_for_classifier(adv),
-                lambda logits: objective_cw(
+                lambda logits: cw_loss(
                     logits,
                     attack_label,
                     targeted=args.target != -1,
@@ -3270,48 +3118,21 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 )
 
             loss_spa = torch.norm(adv_0, p=1)
-            binary_mask = controller_support_mask(
-                args.architecture_mode,
-                adv_00,
-                structured_mask=structured_mask,
-            )
-            loss_qua = quantization_loss(
-                args.architecture_mode,
-                adv_00,
-                structured_mask=structured_mask,
-                egs_smooth_loss=args.egs_tsaa_smooth_loss,
-            )
-            lambda2_applied = (
-                egs_lambda2_for_epoch(
-                    epoch,
-                    stage1_lambda2=args.egs_tsaa_stage1_lam2,
-                    stage2_start_epoch=args.egs_tsaa_stage2_start_epoch,
-                    stage2_lambda2=args.egs_tsaa_stage2_lam2,
-                )
-                if args.architecture_mode == "egs_tsaa"
-                else args.lam_2
-            )
-            loss, guidance_loss = assemble_mode_loss(
-                args.architecture_mode,
-                adversarial_loss=loss_adv,
-                sparse_loss=loss_spa,
-                quantization_loss_value=loss_qua,
-                lambda1=lambda1_applied,
-                lambda2=lambda2_applied,
-                lambda3=args.lam_3,
-                adv_inf=(
-                    adv_inf
-                    if args.architecture_mode in {"simple", "gpg"}
-                    else None
-                ),
-                pgd_delta=grad_delta,
-                feature_guidance=generator_aux.get("feature_guidance"),
+            binary_mask = (adv_00 >= 0.5).to(dtype=adv_00.dtype)
+            loss_qua = torch.sum((binary_mask - adv_00) ** 2)
+            loss = (
+                loss_adv
+                + lambda1_applied * loss_spa
+                + args.lam_2 * loss_qua
+                + args.lam_3 * grad_guided_loss
+                + args.lam_3 * feature_guidance_loss
             )
             loss.backward()
             optimizer.step()
 
             batch_size_actual = image.shape[0]
-            batch_support = binary_mask.detach().flatten(1).sum(dim=1)
+            processed_batches += 1
+            batch_support = hard_spatial_support(adv_00)
             support_sum += float(batch_support.sum().item())
             support_samples += batch_size_actual
             fool_count_epoch += batch_fool_count
@@ -3327,8 +3148,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     "loss": float(loss.detach()),
                     "adv_loss": float(loss_adv.detach()),
                     "spa_weighted": float((lambda1_applied * loss_spa).detach()),
-                    "qua_weighted": float((lambda2_applied * loss_qua).detach()),
-                    "guidance_weighted": float(guidance_loss.detach()),
+                    "qua_weighted": float((args.lam_2 * loss_qua).detach()),
                     "l0": float(batch_support.to(dtype=torch.float64).mean().item()),
                     "l1": float(
                         (torch.norm(perturbation, p=1) / batch_size_actual).item()
@@ -3346,10 +3166,10 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 LOGGER.info(
                     "epoch=%d progress=%d/%d lambda1=%.9g l0=%.2f l1=%.2f "
                     "l2=%.2f linf=%.6f loss=%.3f adv=%.3f spa=%.3f "
-                    "qua=%.3f guidance=%.3f FR=%.4f",
+                    "qua=%.3f FR=%.4f",
                     epoch,
                     batch_index,
-                    len(train_loader),
+                    epoch_batch_total,
                     lambda1_applied,
                     last_metrics["l0"],
                     last_metrics["l1"],
@@ -3359,7 +3179,6 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     last_metrics["adv_loss"],
                     last_metrics["spa_weighted"],
                     last_metrics["qua_weighted"],
-                    last_metrics["guidance_weighted"],
                     last_metrics["fool_rate_window"],
                 )
 
@@ -3379,12 +3198,40 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
 
         if support_samples == 0:
             raise RuntimeError("training loader produced no samples")
+        if processed_batches != epoch_batch_total:
+            raise RuntimeError(
+                "training loader ended before the configured epoch batch count: "
+                f"processed={processed_batches}, expected={epoch_batch_total}"
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timing = epoch_timing_metrics(
+            elapsed_seconds=time.perf_counter() - epoch_start_time,
+            processed_batches=processed_batches,
+            processed_samples=support_samples,
+        )
         observed_k = support_sum / support_samples
         fool_rate_epoch = fool_count_epoch / support_samples
         print(
             f"running:{epoch} | FR-{args.model_type}:{fool_rate_epoch:.6f} | "
             f"lambda1:{lambda1_applied:.9g} | support:{observed_k:.3f}/"
             f"{target_k}"
+        )
+        print(
+            f"timing:{epoch} | batches:{processed_batches} | "
+            f"samples:{support_samples} | seconds:{timing['seconds']:.3f} | "
+            f"batches/s:{timing['batches_per_second']:.3f} | "
+            f"images/s:{timing['images_per_second']:.3f}"
+        )
+        LOGGER.info(
+            "epoch_timing epoch=%d batches=%d samples=%d seconds=%.9g "
+            "batches_per_second=%.9g images_per_second=%.9g",
+            epoch,
+            processed_batches,
+            support_samples,
+            timing["seconds"],
+            timing["batches_per_second"],
+            timing["images_per_second"],
         )
         LOGGER.info(
             "epoch_summary epoch=%d FR=%.9g lambda1_applied=%.9g "
@@ -3433,8 +3280,6 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 training_path,
             )
 
-    if egs_conditioner is not None:
-        egs_conditioner.close()
     return output_path
 
 
@@ -3473,20 +3318,24 @@ if __name__ == "__main__":
 __all__ = [
     "CHECKPOINT_FORMAT",
     "DEFAULT_WORKER_TIMEOUT_SECONDS",
+    "DROPOUT_TRAINING_CHECKPOINT_FORMAT",
+    "GENERATOR_MODES",
+    "GENERATOR_TYPES_BY_MODE",
     "INFERENCE_CHECKPOINT_FORMAT",
-    "LAYER1_DROPOUT_TRAINING_CHECKPOINT_FORMAT",
+    "ISOLATED_GENERATOR_TYPE",
     "LAYER1_DROPOUT_DEFAULTS",
-    "LEGACY_INFERENCE_CHECKPOINT_FORMAT",
+    "LEGACY_GENERATOR_TYPE",
+    "LegacyGPGGenerator",
     "LEGACY_TRAINING_CHECKPOINT_FORMAT",
-    "PREVIOUS_TRAINING_CHECKPOINT_FORMAT",
+    "NIPS2017Dataset",
+    "PREVIOUS_INFERENCE_CHECKPOINT_FORMAT",
+    "SPLIT_GENERATOR_TYPE",
     "DDSCControllerConfig",
     "DDSCControllerState",
-    "EGSStructuredMask",
     "IsolatedResNet50Layer1ChannelDropoutEOT",
     "attack_model_contract",
     "attack_model_loss_and_logits",
     "attack_pgd",
-    "assemble_mode_loss",
     "build_attack_model",
     "build_attack_objective_model",
     "build_generator_from_inference_checkpoint",
@@ -3494,20 +3343,19 @@ __all__ = [
     "build_training_data_loader",
     "capture_rng_state",
     "controller_config_from_args",
-    "controller_support_mask",
     "cw_loss",
     "ddsc_controller_transition",
     "dataset_contract",
+    "epoch_timing_metrics",
     "experiment_fingerprint",
     "expected_adam_group_options",
     "expected_optimizer_step",
     "file_fingerprint",
+    "generator_mode_for_type",
+    "generator_type_for_mode",
     "hard_spatial_support",
-    "forward_generator_inference",
-    "forward_generator_training",
     "initial_controller_state",
     "lambda1_for_epoch",
-    "legacy_cw_loss",
     "load_controller_state",
     "load_inference_checkpoint",
     "load_training_checkpoint",
@@ -3515,7 +3363,6 @@ __all__ = [
     "normalize_for_classifier",
     "optimizer_spec_for_generator",
     "restore_rng_state",
-    "resolve_training_device",
     "runtime_contract",
     "run_training",
     "save_epoch_checkpoints",

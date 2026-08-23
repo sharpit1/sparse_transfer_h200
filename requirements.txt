@@ -6,3 +6,9 @@ Pillow>=10,<13
 tqdm>=4.65,<5
 torch>=2.11,<2.13
 torchvision>=0.26,<0.28
+
+# Transfer-ASR victim models used by evaluate_ddsc_gpg_all_model_t.py.
+timm==1.0.28
+huggingface-hub==1.24.0
+safetensors==0.8.0
+PyYAML>=6.0,<7

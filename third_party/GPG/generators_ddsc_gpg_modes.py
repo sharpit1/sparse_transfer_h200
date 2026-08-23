@@ -2,14 +2,16 @@
 
 The generator keeps GPG's perturbation and stochastic soft/hard mask outputs,
 but replaces both learned image encoders with a frozen ImageNet ResNet-50 V1
-prefix (conv1 -> bn1 -> relu -> maxpool -> layer1).  The decoder can either
-share its complete upsampling trunk or split into independent perturbation and
-mask upsampling branches after the common residual trunk.
+prefix (conv1 -> bn1 -> relu -> maxpool -> layer1).  The shared variant uses
+one upsampling trunk for both outputs; the split variant keeps the adapter and
+residual body shared but learns independent perturbation and mask upsampling
+trunks.
 
 The legacy feature-alignment loss is intentionally not implemented.  Once the
 encoder is frozen, a distance between clean and PGD-image encoder features is
 constant with respect to the decoder and therefore cannot train it.  The GPG
-pixel-space PGD guidance loss remains in ``DDSC_GPG_train.py``.
+pixel-space PGD guidance loss remains in
+``DDSC_GPG_generator_modes_train.py``.
 """
 
 from __future__ import annotations
@@ -27,17 +29,6 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 GENERATOR_TYPE = "ddsc_gpg_resnet50_layer1_shared_lite_v1"
 SPLIT_GENERATOR_TYPE = "ddsc_gpg_resnet50_layer1_split_lite_v1"
-SUPPORTED_GENERATOR_TYPES = frozenset({GENERATOR_TYPE, SPLIT_GENERATOR_TYPE})
-
-
-def generator_type_for_decoder_mode(decoder_mode: str) -> str:
-    """Return the checkpoint identity for one supported decoder topology."""
-
-    if decoder_mode == "shared":
-        return GENERATOR_TYPE
-    if decoder_mode == "split":
-        return SPLIT_GENERATOR_TYPE
-    raise ValueError("decoder_mode must be shared or split")
 
 
 def module_state_sha256(module: nn.Module) -> str:
@@ -133,29 +124,24 @@ class DepthwiseResidualBlock(nn.Module):
         return feature + self.block(feature)
 
 
-def _build_upsample_stages(
+def _make_adapter(input_channels: int, width: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(input_channels, width, kernel_size=1, bias=False),
+        nn.BatchNorm2d(width),
+        nn.ReLU(inplace=True),
+    )
+
+
+def _make_upsample_block(
     input_channels: int,
-    middle_channels: int,
     output_channels: int,
     upsample_backend: str,
-) -> tuple[nn.Sequential, nn.Sequential]:
-    """Construct one two-stage decoder branch without sharing its parameters."""
-
+) -> nn.Sequential:
     if upsample_backend == "nearest_conv":
-        upsample1: tuple[nn.Module, ...] = (
+        modules: tuple[nn.Module, ...] = (
             nn.Upsample(scale_factor=2, mode="nearest"),
             nn.Conv2d(
                 input_channels,
-                middle_channels,
-                kernel_size=3,
-                padding=1,
-                bias=False,
-            ),
-        )
-        upsample2: tuple[nn.Module, ...] = (
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(
-                middle_channels,
                 output_channels,
                 kernel_size=3,
                 padding=1,
@@ -163,20 +149,9 @@ def _build_upsample_stages(
             ),
         )
     elif upsample_backend == "transpose":
-        upsample1 = (
+        modules = (
             nn.ConvTranspose2d(
                 input_channels,
-                middle_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                output_padding=1,
-                bias=False,
-            ),
-        )
-        upsample2 = (
-            nn.ConvTranspose2d(
-                middle_channels,
                 output_channels,
                 kernel_size=3,
                 stride=2,
@@ -185,19 +160,12 @@ def _build_upsample_stages(
                 bias=False,
             ),
         )
-    else:
-        raise ValueError("upsample_backend must be nearest_conv or transpose")
-    return (
-        nn.Sequential(
-            *upsample1,
-            nn.BatchNorm2d(middle_channels),
-            nn.ReLU(inplace=True),
-        ),
-        nn.Sequential(
-            *upsample2,
-            nn.BatchNorm2d(output_channels),
-            nn.ReLU(inplace=True),
-        ),
+    else:  # pragma: no cover - public constructors validate this first
+        raise ValueError("unsupported upsample backend")
+    return nn.Sequential(
+        *modules,
+        nn.BatchNorm2d(output_channels),
+        nn.ReLU(inplace=True),
     )
 
 
@@ -237,11 +205,59 @@ class SharedLiteGPGDecoder(nn.Module):
         self.resblocks = nn.Sequential(
             *(DepthwiseResidualBlock(width) for _ in range(num_blocks))
         )
-        self.upsample1, self.upsample2 = _build_upsample_stages(
-            width,
-            middle_channels,
-            output_channels,
-            upsample_backend,
+        if upsample_backend == "nearest_conv":
+            upsample1: tuple[nn.Module, ...] = (
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(
+                    width,
+                    middle_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+            )
+            upsample2: tuple[nn.Module, ...] = (
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(
+                    middle_channels,
+                    output_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+            )
+        else:
+            upsample1 = (
+                nn.ConvTranspose2d(
+                    width,
+                    middle_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    bias=False,
+                ),
+            )
+            upsample2 = (
+                nn.ConvTranspose2d(
+                    middle_channels,
+                    output_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    bias=False,
+                ),
+            )
+        self.upsample1 = nn.Sequential(
+            *upsample1,
+            nn.BatchNorm2d(middle_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.upsample2 = nn.Sequential(
+            *upsample2,
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU(inplace=True),
         )
         self.perturbation_head = nn.Sequential(
             nn.ReflectionPad2d(3),
@@ -274,7 +290,7 @@ class SharedLiteGPGDecoder(nn.Module):
 
 
 class SplitLiteGPGDecoder(nn.Module):
-    """Use independent perturbation and mask upsampling decoder branches."""
+    """Share the adapter/body and split both learnable upsampling stages."""
 
     def __init__(
         self,
@@ -301,28 +317,21 @@ class SplitLiteGPGDecoder(nn.Module):
         output_channels = max(1, width // 4)
         self.trunk_channels = (self.width, middle_channels, output_channels)
 
-        self.adapter = nn.Sequential(
-            nn.Conv2d(input_channels, width, kernel_size=1, bias=False),
-            nn.BatchNorm2d(width),
-            nn.ReLU(inplace=True),
-        )
+        self.adapter = _make_adapter(input_channels, width)
         self.resblocks = nn.Sequential(
             *(DepthwiseResidualBlock(width) for _ in range(num_blocks))
         )
-        (
-            self.perturbation_upsample1,
-            self.perturbation_upsample2,
-        ) = _build_upsample_stages(
-            width,
-            middle_channels,
-            output_channels,
-            upsample_backend,
+        self.perturbation_upsample1 = _make_upsample_block(
+            width, middle_channels, upsample_backend
         )
-        self.mask_upsample1, self.mask_upsample2 = _build_upsample_stages(
-            width,
-            middle_channels,
-            output_channels,
-            upsample_backend,
+        self.perturbation_upsample2 = _make_upsample_block(
+            middle_channels, output_channels, upsample_backend
+        )
+        self.mask_upsample1 = _make_upsample_block(
+            width, middle_channels, upsample_backend
+        )
+        self.mask_upsample2 = _make_upsample_block(
+            middle_channels, output_channels, upsample_backend
         )
         self.perturbation_head = nn.Sequential(
             nn.ReflectionPad2d(3),
@@ -336,11 +345,11 @@ class SplitLiteGPGDecoder(nn.Module):
     def forward(
         self, encoder_feature: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        code = self.adapter(encoder_feature)
-        code = self.resblocks(code)
-        perturbation = self.perturbation_upsample1(code)
+        shared = self.adapter(encoder_feature)
+        shared = self.resblocks(shared)
+        perturbation = self.perturbation_upsample1(shared)
         perturbation = self.perturbation_upsample2(perturbation)
-        mask = self.mask_upsample1(code)
+        mask = self.mask_upsample1(shared)
         mask = self.mask_upsample2(mask)
         return self.perturbation_head(perturbation), self.mask_head(mask)
 
@@ -352,15 +361,16 @@ class SplitLiteGPGDecoder(nn.Module):
             "num_blocks": self.num_blocks,
             "upsample_backend": self.upsample_backend,
             "shared_upsample_trunk": False,
-            "split_after": "resblocks",
+            "split_point": "after_shared_residual_body",
             "trunk_channels": list(self.trunk_channels),
         }
 
 
 class DDSCGPGGenerator(nn.Module):
-    """Frozen ResNet layer1 encoder plus a configurable trainable decoder."""
+    """Frozen ResNet layer1 encoder plus a trainable GPG shared-lite decoder."""
 
     generator_type = GENERATOR_TYPE
+    decoder_class = SharedLiteGPGDecoder
 
     def __init__(
         self,
@@ -370,18 +380,10 @@ class DDSCGPGGenerator(nn.Module):
         decoder_width: int = 128,
         decoder_num_blocks: int = 3,
         decoder_upsample_backend: str = "transpose",
-        decoder_mode: str = "shared",
     ) -> None:
         super().__init__()
-        self.decoder_mode = str(decoder_mode)
-        self.generator_type = generator_type_for_decoder_mode(self.decoder_mode)
         self.encoder = FrozenResNet50Layer1(resnet50)
-        decoder_class = (
-            SharedLiteGPGDecoder
-            if self.decoder_mode == "shared"
-            else SplitLiteGPGDecoder
-        )
-        self.decoder = decoder_class(
+        self.decoder = self.decoder_class(
             width=decoder_width,
             num_blocks=decoder_num_blocks,
             upsample_backend=decoder_upsample_backend,
@@ -472,6 +474,13 @@ class DDSCGPGGenerator(nn.Module):
         }
 
 
+class DDSCSplitGPGGenerator(DDSCGPGGenerator):
+    """Frozen ResNet plus shared adapter/body and split output trunks."""
+
+    generator_type = SPLIT_GENERATOR_TYPE
+    decoder_class = SplitLiteGPGDecoder
+
+
 def parameter_count(module: nn.Module, *, trainable_only: bool = False) -> int:
     """Return a deterministic parameter count for logging and tests."""
 
@@ -484,16 +493,15 @@ def parameter_count(module: nn.Module, *, trainable_only: bool = False) -> int:
 
 __all__ = [
     "DDSCGPGGenerator",
+    "DDSCSplitGPGGenerator",
     "DepthwiseResidualBlock",
     "FrozenResNet50Layer1",
     "GENERATOR_TYPE",
     "IMAGENET_MEAN",
     "IMAGENET_STD",
-    "SPLIT_GENERATOR_TYPE",
-    "SUPPORTED_GENERATOR_TYPES",
     "SharedLiteGPGDecoder",
+    "SPLIT_GENERATOR_TYPE",
     "SplitLiteGPGDecoder",
-    "generator_type_for_decoder_mode",
     "module_state_sha256",
     "parameter_count",
 ]

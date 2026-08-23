@@ -144,7 +144,7 @@ export PYTHONFAULTHANDLER=1
 
 mkdir -p "$TORCH_HOME" "$out_root"
 
-exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_train.py" \
+exec "$python_bin" -u "$root/third_party/GPG/DDSC_GPG_generator_modes_train.py" \
     --train_dir "$train_dir" \
     --model_type res50 \
     --generator_mode "$generator_mode" \

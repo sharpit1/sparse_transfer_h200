@@ -10,7 +10,7 @@ try:
     import torch
     import torchvision
 
-    from third_party.GPG.DDSC_GPG_train import (
+    from third_party.GPG.DDSC_GPG_generator_modes_train import (
         CHECKPOINT_FORMAT,
         INFERENCE_CHECKPOINT_FORMAT,
         ISOLATED_DECODER_DEFAULTS,
@@ -28,7 +28,7 @@ try:
         validate_optimizer_state_dict,
         validate_resume_metadata,
     )
-    from third_party.GPG.generators_ddsc_gpg import (
+    from third_party.GPG.generators_ddsc_gpg_modes import (
         DDSCGPGGenerator,
         DDSCSplitGPGGenerator,
         SPLIT_GENERATOR_TYPE,
