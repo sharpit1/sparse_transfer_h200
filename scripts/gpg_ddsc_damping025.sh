@@ -475,18 +475,31 @@ results_json="${eval_out_dir}/results.json"
 [[ -s "${results_json}" ]] || fail "Evaluation results are missing: ${results_json}"
 "${python_bin}" - "${results_json}" <<'PY'
 import json
+import math
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     payload = json.load(handle)
 if payload.get("status") != "complete":
     raise SystemExit("transfer evaluation did not complete")
+perturbation = payload.get("perturbation")
+if not isinstance(perturbation, dict):
+    raise SystemExit("transfer evaluation contains no perturbation metrics")
+active_ratio = perturbation.get("mean_mask_active_ratio")
+if (
+    isinstance(active_ratio, bool)
+    or not isinstance(active_ratio, (int, float))
+    or not math.isfinite(float(active_ratio))
+    or not 0.0 <= float(active_ratio) <= 1.0
+):
+    raise SystemExit("transfer evaluation contains an invalid mean mask active ratio")
 rows = payload.get("models")
 if not isinstance(rows, list) or not rows:
     raise SystemExit("transfer evaluation contains no model rows")
 transfer = [row for row in rows if row.get("model_t") != "res50"]
 if not transfer:
     raise SystemExit("transfer evaluation contains no non-source victim")
+print(f"mean_active_pixel_percent={100.0 * float(active_ratio):.6f}")
 print("transfer_asr_clean_correct_percent")
 transfer_values = []
 for row in transfer:
