@@ -21,6 +21,12 @@ ddsc_restoring_gain="${DDSC_RESTORING_GAIN:-}"
 ddsc_target_density="${DDSC_TARGET_DENSITY:-0.10}"
 ddsc_warmup_epochs="${DDSC_WARMUP_EPOCHS:-2}"
 ddsc_damping="${DDSC_DAMPING:-0.25}"
+layer1_dropout_mode="${LAYER1_DROPOUT_MODE:-off}"
+layer1_dropout_p="${LAYER1_DROPOUT_P:-0.7}"
+layer1_dropout_channel_ratio="${LAYER1_DROPOUT_CHANNEL_RATIO:-0.3}"
+layer1_dropout_hf_ratio="${LAYER1_DROPOUT_HF_RATIO:-0.35}"
+layer1_dropout_eot_samples="${LAYER1_DROPOUT_EOT_SAMPLES:-1}"
+layer1_dropout_eot_reduction="${LAYER1_DROPOUT_EOT_REDUCTION:-logits}"
 load_cp="${LOAD_CP:-New}"
 cp_path="${CP_PATH:-}"
 run_transfer_eval="${RUN_TRANSFER_EVAL:-1}"
@@ -56,6 +62,10 @@ Continue an architecture-mode DDSC-GPG run:
 Training only:
   RUN_TRANSFER_EVAL=0 bash $0 [imagenet-train-dir]
 
+Frequency-channel dropout for the GPG attack objective:
+  LAYER1_DROPOUT_MODE=frequency_channel \
+  LAYER1_DROPOUT_EOT_REDUCTION=loss bash $0 [train-dir] [val-dir]
+
 EPOCHS is the total target epoch count, not the number of additional epochs.
 All trajectory and runtime settings must match the checkpoint exactly.
 Evaluation defaults to 18 unique victim implementations and requires
@@ -88,6 +98,18 @@ case "${auto_download_eval_assets}" in
     0|1) ;;
     *) fail "AUTO_DOWNLOAD_EVAL_ASSETS must be 0 or 1" ;;
 esac
+case "${layer1_dropout_mode}" in
+    off|frequency_channel) ;;
+    *) fail "LAYER1_DROPOUT_MODE must be off or frequency_channel" ;;
+esac
+case "${layer1_dropout_eot_reduction}" in
+    logits|loss) ;;
+    *) fail "LAYER1_DROPOUT_EOT_REDUCTION must be logits or loss" ;;
+esac
+if [[ "${layer1_dropout_mode}" == "frequency_channel" \
+    && "${layer1_dropout_eot_reduction}" != "loss" ]]; then
+    fail "GPG frequency-channel dropout requires LAYER1_DROPOUT_EOT_REDUCTION=loss"
+fi
 
 for integer_setting in \
     "EPOCHS=${epochs}" \
@@ -96,7 +118,8 @@ for integer_setting in \
     "EVAL_BATCH_SIZE=${eval_batch_size}" \
     "EVAL_NUM_WORKERS=${eval_num_workers}" \
     "EVAL_SAMPLES=${eval_samples}" \
-    "EVAL_STATE_EVERY_BATCHES=${eval_state_every_batches}"
+    "EVAL_STATE_EVERY_BATCHES=${eval_state_every_batches}" \
+    "LAYER1_DROPOUT_EOT_SAMPLES=${layer1_dropout_eot_samples}"
 do
     name="${integer_setting%%=*}"
     value="${integer_setting#*=}"
@@ -107,6 +130,8 @@ done
 (( eval_batch_size > 0 )) || fail "EVAL_BATCH_SIZE must be positive"
 (( eval_state_every_batches > 0 )) || \
     fail "EVAL_STATE_EVERY_BATCHES must be positive"
+(( layer1_dropout_eot_samples > 0 )) || \
+    fail "LAYER1_DROPOUT_EOT_SAMPLES must be positive"
 
 is_imagenet_imagefolder() {
     local candidate="$1"
@@ -371,6 +396,10 @@ printf 'load_cp=%s checkpoint=%s\n' "${load_cp}" "${cp_path:-none}"
 printf 'epochs_total=%s batch_size=%s lambda1_init=%s\n' \
     "${epochs}" "${batch_size}" "${lambda1_init}"
 printf 'ddsc_restoring_gain=%s\n' "${ddsc_restoring_gain:-default(lam_1)}"
+printf 'layer1_dropout_mode=%s p=%s channel_ratio=%s hf_ratio=%s eot_samples=%s eot_reduction=%s\n' \
+    "${layer1_dropout_mode}" "${layer1_dropout_p}" \
+    "${layer1_dropout_channel_ratio}" "${layer1_dropout_hf_ratio}" \
+    "${layer1_dropout_eot_samples}" "${layer1_dropout_eot_reduction}"
 printf 'out_root=%s gpu_id=%s device=%s\n' \
     "${out_root}" "${gpu_id}" "${device}"
 if [[ "${run_transfer_eval}" == "1" ]]; then
@@ -405,7 +434,12 @@ trainer_command=(
     --decoder_num_blocks 3
     --decoder_upsample_backend transpose
     --decoder_mode shared
-    --layer1_dropout_mode off
+    --layer1_dropout_mode "${layer1_dropout_mode}"
+    --layer1_dropout_p "${layer1_dropout_p}"
+    --layer1_dropout_channel_ratio "${layer1_dropout_channel_ratio}"
+    --layer1_dropout_hf_ratio "${layer1_dropout_hf_ratio}"
+    --layer1_dropout_eot_samples "${layer1_dropout_eot_samples}"
+    --layer1_dropout_eot_reduction "${layer1_dropout_eot_reduction}"
     --save_every 1
     --ddsc_target_density "${ddsc_target_density}"
     --ddsc_warmup_epochs "${ddsc_warmup_epochs}"
