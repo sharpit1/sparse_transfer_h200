@@ -1,4 +1,4 @@
-"""Evaluate one DDSC-GPG inference checkpoint against every Eval_GPG victim.
+"""Evaluate one DDSC or source-generator checkpoint against every victim.
 
 The attack is generated once per ImageNet batch and shared by all victim
 models.  This preserves Eval_GPG's prediction-flip metric while avoiding eleven
@@ -18,6 +18,7 @@ import platform
 import random
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -43,15 +44,21 @@ if str(GPG_ROOT) not in sys.path:
 from DDSC_GPG_train import (  # noqa: E402
     attack_model_contract,
     build_generator_from_inference_checkpoint,
+    validate_module_state_dict_finite,
 )
 from ddsc_architecture_modes import (  # noqa: E402
     EGSStructuredMask,
     architecture_mode_from_generator_type,
+    build_original_generator,
+    canonical_architecture_mode,
     egs_conditioner_contract,
     forward_generator_inference,
+    generator_architecture_metadata,
+    generator_type_for_architecture_mode,
     validate_egs_conditioner_contract,
 )
 from generators_ddsc_gpg import module_state_sha256  # noqa: E402
+from generators_modify import GeneratorResnet as GPGGeneratorResnet  # noqa: E402
 
 
 MODEL_ORDER = (
@@ -121,15 +128,70 @@ OPENMMLAB_MAE_VIT_SHA256 = (
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 PROGRESS_STATE_SCHEMA = 3
-EVALUATION_CONTRACT_SCHEMA = 3
+EVALUATION_CONTRACT_SCHEMA = 4
 METRICS_SCHEMA = 1
+RAW_ARCHITECTURE_MODES = ("gpg", "tsaa", "egs_tsaa", "egs_tssa")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a DDSC-GPG checkpoint against all Eval_GPG model_t values."
+        description=(
+            "Evaluate a DDSC inference checkpoint or raw GPG/TSAA/EGS-TSSA "
+            "state_dict against all Eval_GPG model_t values."
+        )
     )
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--architecture-mode",
+        "--raw-architecture-mode",
+        dest="architecture_mode",
+        choices=RAW_ARCHITECTURE_MODES,
+        help=(
+            "generator architecture for a raw state_dict checkpoint; GPG can "
+            "usually be inferred, while TSAA and EGS-TSSA require this option"
+        ),
+    )
+    parser.add_argument(
+        "--model-type",
+        "--raw-model-type",
+        dest="model_type",
+        choices=("res50", "incv3"),
+        help="source model type for a raw checkpoint",
+    )
+    parser.add_argument(
+        "--eps-pixels",
+        "--raw-eps-pixels",
+        dest="eps_pixels",
+        type=float,
+        help="pixel-space perturbation budget for a raw checkpoint",
+    )
+    parser.add_argument(
+        "--target",
+        "--raw-target",
+        dest="target",
+        type=int,
+        help="training target for a raw checkpoint; defaults to -1 (untargeted)",
+    )
+    parser.add_argument(
+        "--completed-epoch",
+        "--raw-completed-epoch",
+        dest="completed_epoch",
+        type=int,
+        help="optional epoch provenance for a raw checkpoint; defaults to 0",
+    )
+    parser.add_argument(
+        "--egs-tsaa-tk",
+        "--egs-tssa-tk",
+        dest="egs_tsaa_tk",
+        type=float,
+        help="EGS-TSSA top-k spatial fraction for a raw checkpoint; defaults to 0.6",
+    )
+    parser.add_argument(
+        "--gpg-generator-mode",
+        choices=("auto", "legacy", "isolated"),
+        default="auto",
+        help="GPG encoder mode for a raw checkpoint",
+    )
     parser.add_argument("--imagenet-val-root", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument(
@@ -145,6 +207,273 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-every-batches", type=int, default=25)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
+
+
+def _raw_state_dict_from_object(
+    checkpoint_object: Any,
+) -> tuple[dict[str, torch.Tensor], Mapping[str, Any], str]:
+    """Extract a generator state_dict from common source-training formats."""
+
+    if not isinstance(checkpoint_object, Mapping):
+        raise ValueError(
+            "raw checkpoint must be a state_dict or a mapping containing one"
+        )
+    metadata = checkpoint_object
+    wrapper_key = "root"
+    candidate: Any = checkpoint_object
+    if not checkpoint_object or not all(
+        isinstance(key, str) and isinstance(value, torch.Tensor)
+        for key, value in checkpoint_object.items()
+    ):
+        candidate = None
+        for key in ("generator_state_dict", "state_dict", "netG", "model"):
+            value = checkpoint_object.get(key)
+            if (
+                isinstance(value, Mapping)
+                and value
+                and all(
+                    isinstance(name, str) and isinstance(tensor, torch.Tensor)
+                    for name, tensor in value.items()
+                )
+            ):
+                candidate = value
+                wrapper_key = key
+                break
+    if not isinstance(candidate, Mapping) or not candidate:
+        raise ValueError(
+            "raw checkpoint does not contain a tensor-only generator state_dict"
+        )
+    state_dict = dict(candidate)
+    if all(name.startswith("module.") for name in state_dict):
+        state_dict = {
+            name[len("module.") :]: tensor for name, tensor in state_dict.items()
+        }
+        wrapper_key = f"{wrapper_key}:module_prefix_stripped"
+    validate_module_state_dict_finite(
+        state_dict,
+        field_name="raw_generator_state_dict",
+    )
+    return state_dict, metadata, wrapper_key
+
+
+def _metadata_value(
+    args: argparse.Namespace,
+    metadata: Mapping[str, Any],
+    argument_name: str,
+    metadata_name: str,
+    default: Any = None,
+) -> Any:
+    argument = getattr(args, argument_name, None)
+    if argument is not None:
+        return argument
+    return metadata.get(metadata_name, default)
+
+
+def _raw_architecture_mode(
+    args: argparse.Namespace,
+    metadata: Mapping[str, Any],
+    state_dict: Mapping[str, torch.Tensor],
+) -> str:
+    requested = getattr(args, "architecture_mode", None)
+    if requested is not None:
+        return canonical_architecture_mode(requested)
+    generator_type = metadata.get("generator_type")
+    if isinstance(generator_type, str):
+        try:
+            return architecture_mode_from_generator_type(generator_type)
+        except ValueError:
+            pass
+    architecture = metadata.get("architecture")
+    if isinstance(architecture, Mapping) and isinstance(
+        architecture.get("architecture_mode"), str
+    ):
+        return canonical_architecture_mode(architecture["architecture_mode"])
+    if any(name.startswith(("Grad_block", "isolated_encoder.")) for name in state_dict):
+        return "gpg"
+    raise ValueError(
+        "raw TSAA and EGS-TSSA checkpoints have the same state schema; pass "
+        "--architecture-mode tsaa or --architecture-mode egs_tsaa"
+    )
+
+
+def _gpg_encoder_mode(
+    args: argparse.Namespace,
+    state_dict: Mapping[str, torch.Tensor],
+) -> str:
+    inferred = (
+        "isolated"
+        if any(name.startswith("isolated_encoder.") for name in state_dict)
+        else "legacy"
+    )
+    requested = getattr(args, "gpg_generator_mode", "auto")
+    if requested == "auto":
+        return inferred
+    if requested != inferred:
+        raise ValueError(
+            "--gpg-generator-mode disagrees with the raw checkpoint state schema"
+        )
+    return requested
+
+
+def _isolated_gpg_architecture_metadata(
+    generator: torch.nn.Module,
+    *,
+    eps: float,
+    inception: bool,
+) -> dict[str, Any]:
+    return {
+        "generator_type": generator_type_for_architecture_mode("gpg"),
+        "architecture_mode": "gpg",
+        "source_method": "GPG",
+        "class_name": "GeneratorResnet",
+        "encoder_mode": "isolated",
+        "inception_crop": inception,
+        "eps": eps,
+        "state_entry_count": len(generator.state_dict()),
+        "parameter_count": sum(
+            parameter.numel() for parameter in generator.parameters()
+        ),
+        "trainable_parameter_count": sum(
+            parameter.numel()
+            for parameter in generator.parameters()
+            if parameter.requires_grad
+        ),
+    }
+
+
+def build_generator_from_compatible_checkpoint(
+    path: str | os.PathLike[str],
+    args: argparse.Namespace,
+) -> tuple[torch.nn.Module, Mapping[str, Any]]:
+    """Load either a self-describing DDSC checkpoint or a source raw state_dict."""
+
+    with torch.inference_mode(False), torch.no_grad():
+        checkpoint_object = torch.load(path, map_location="cpu", weights_only=True)
+    if type(checkpoint_object) is tuple:
+        return build_generator_from_inference_checkpoint(path)
+
+    state_dict, metadata, wrapper_key = _raw_state_dict_from_object(checkpoint_object)
+    architecture_mode = _raw_architecture_mode(args, metadata, state_dict)
+    if architecture_mode == "simple":
+        raise ValueError("raw DDSC simple-generator checkpoints are unsupported")
+    model_type = _metadata_value(args, metadata, "model_type", "model_type")
+    if model_type not in {"res50", "incv3"}:
+        raise ValueError(
+            "raw checkpoints do not encode the source input size; pass "
+            "--model-type res50 or --model-type incv3"
+        )
+    eps_pixels = _metadata_value(args, metadata, "eps_pixels", "eps_pixels")
+    if (
+        not isinstance(eps_pixels, (int, float))
+        or isinstance(eps_pixels, bool)
+        or not math.isfinite(float(eps_pixels))
+        or float(eps_pixels) <= 0.0
+    ):
+        raise ValueError(
+            "raw checkpoints do not encode the perturbation budget; pass a "
+            "finite positive --eps-pixels value"
+        )
+    eps_pixels = float(eps_pixels)
+    eps = eps_pixels / 255.0
+    inception = model_type == "incv3"
+
+    gpg_encoder_mode = "legacy"
+    if architecture_mode == "gpg":
+        gpg_encoder_mode = _gpg_encoder_mode(args, state_dict)
+    if architecture_mode == "gpg" and gpg_encoder_mode == "isolated":
+        if model_type != "res50":
+            raise ValueError("isolated GPG raw checkpoints require --model-type res50")
+        generator = GPGGeneratorResnet(
+            inception=False,
+            eps=eps,
+            evaluate=True,
+            encoder_mode="isolated",
+            encoder_backbone=torchvision.models.resnet50(weights=None),
+        ).float()
+    else:
+        generator = build_original_generator(
+            architecture_mode,
+            inception=inception,
+            eps=eps,
+            inference=True,
+        ).float()
+
+    egs_tk: float | None = None
+    if architecture_mode == "egs_tsaa":
+        architecture = metadata.get("architecture")
+        metadata_tk = (
+            architecture.get("egs_tk") if isinstance(architecture, Mapping) else None
+        )
+        egs_tk = _metadata_value(
+            args,
+            metadata,
+            "egs_tsaa_tk",
+            "egs_tsaa_tk",
+            metadata_tk if metadata_tk is not None else 0.6,
+        )
+        if (
+            not isinstance(egs_tk, (int, float))
+            or isinstance(egs_tk, bool)
+            or not math.isfinite(float(egs_tk))
+            or not 0.0 < float(egs_tk) <= 1.0
+        ):
+            raise ValueError("--egs-tsaa-tk must be finite and in (0, 1]")
+        egs_tk = float(egs_tk)
+        setattr(generator, "ddsc_egs_tk", egs_tk)
+
+    try:
+        generator.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"raw checkpoint state schema is incompatible with {architecture_mode}: {exc}"
+        ) from exc
+    validate_module_state_dict_finite(
+        generator.state_dict(),
+        field_name="loaded_raw_generator_state_dict",
+    )
+    generator.eval()
+    if architecture_mode == "gpg" and gpg_encoder_mode == "isolated":
+        architecture_metadata = _isolated_gpg_architecture_metadata(
+            generator,
+            eps=eps,
+            inception=inception,
+        )
+    else:
+        architecture_metadata = generator_architecture_metadata(
+            generator,
+            architecture_mode,
+        )
+    architecture_metadata = dict(architecture_metadata)
+    architecture_metadata["raw_checkpoint_wrapper"] = wrapper_key
+
+    target = _metadata_value(args, metadata, "target", "target", -1)
+    completed_epoch = _metadata_value(
+        args,
+        metadata,
+        "completed_epoch",
+        "completed_epoch",
+        0,
+    )
+    if type(target) is not int or target < -1 or target >= 1000:
+        raise ValueError("--target must be -1 or an ImageNet class index")
+    if type(completed_epoch) is not int or completed_epoch < 0:
+        raise ValueError("--completed-epoch must be a nonnegative integer")
+    stored_conditioner = metadata.get("conditioner_contract")
+    if architecture_mode != "egs_tsaa" or not isinstance(stored_conditioner, Mapping):
+        stored_conditioner = None
+    payload = {
+        "kind": "raw_state_dict",
+        "generator_type": generator_type_for_architecture_mode(architecture_mode),
+        "model_type": model_type,
+        "target": target,
+        "eps_pixels": eps_pixels,
+        "image_size": 299 if model_type == "incv3" else 224,
+        "completed_epoch": completed_epoch,
+        "architecture": architecture_metadata,
+        "conditioner_contract": stored_conditioner,
+        "generator_state_dict": state_dict,
+    }
+    return generator, payload
 
 
 def seed_everything(seed: int) -> None:
@@ -339,49 +668,59 @@ def image_loader_contract() -> dict[str, Any]:
     }
 
 
-def input_transform_contract() -> dict[str, Any]:
+def input_transform_contract(image_size: int = 224) -> dict[str, Any]:
+    if image_size not in {224, 299}:
+        raise ValueError("generator image_size must be 224 or 299")
+    resize_size = 256 if image_size == 224 else 300
     return {
         "schema": 1,
         "ordered_steps": [
             {
                 "name": "Resize",
-                "size": 256,
+                "size": resize_size,
                 "interpolation": "bilinear",
                 "antialias": True,
             },
-            {"name": "CenterCrop", "size": 224},
+            {"name": "CenterCrop", "size": image_size},
             {"name": "ToTensor"},
         ],
         "normalization": {
             "mean": list(IMAGENET_MEAN),
             "std": list(IMAGENET_STD),
         },
-        "inception_prediction_resize": {
-            "size": [299, 299],
+        "victim_prediction_resize": {
+            "incv3_size": [299, 299],
+            "other_model_size": [224, 224],
             "mode": "bilinear",
             "align_corners": False,
         },
     }
 
 
-def build_evaluation_transform() -> transforms.Compose:
+def build_evaluation_transform(image_size: int = 224) -> transforms.Compose:
+    if image_size not in {224, 299}:
+        raise ValueError("generator image_size must be 224 or 299")
+    resize_size = 256 if image_size == 224 else 300
     return transforms.Compose(
         [
             transforms.Resize(
-                256,
+                resize_size,
                 interpolation=InterpolationMode.BILINEAR,
                 antialias=True,
             ),
-            transforms.CenterCrop(224),
+            transforms.CenterCrop(image_size),
             transforms.ToTensor(),
         ]
     )
 
 
-def build_evaluation_dataset(data_root: Path) -> datasets.ImageFolder:
+def build_evaluation_dataset(
+    data_root: Path,
+    image_size: int = 224,
+) -> datasets.ImageFolder:
     return datasets.ImageFolder(
         str(data_root),
-        transform=build_evaluation_transform(),
+        transform=build_evaluation_transform(image_size),
         loader=pil_loader,
     )
 
@@ -393,9 +732,13 @@ def normalize(images: torch.Tensor) -> torch.Tensor:
 
 
 def predict(model: torch.nn.Module, name: str, images: torch.Tensor) -> torch.Tensor:
-    if name == "incv3":
+    prediction_size = 299 if name == "incv3" else 224
+    if tuple(images.shape[-2:]) != (prediction_size, prediction_size):
         images = F.interpolate(
-            images, size=(299, 299), mode="bilinear", align_corners=False
+            images,
+            size=(prediction_size, prediction_size),
+            mode="bilinear",
+            align_corners=False,
         )
     logits = model(normalize(images))
     if not isinstance(logits, torch.Tensor):
@@ -939,7 +1282,9 @@ def state_contract(
             "checkpoint_path": str(OPENMMLAB_MAE_VIT_CHECKPOINT.resolve()),
             "expected_sha256": OPENMMLAB_MAE_VIT_SHA256,
         },
-        "input_transform": input_transform_contract(),
+        "input_transform": input_transform_contract(
+            int(checkpoint_payload["image_size"])
+        ),
         "data_loader": {
             "subset": "range(next_index, dataset.sample_count)",
             "batch_size": args.batch_size,
@@ -1435,21 +1780,23 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
-    generator, checkpoint_payload = build_generator_from_inference_checkpoint(
-        checkpoint
+    generator, checkpoint_payload = build_generator_from_compatible_checkpoint(
+        checkpoint,
+        args,
     )
+    checkpoint_payload = dict(checkpoint_payload)
     architecture_mode = architecture_mode_from_generator_type(
         checkpoint_payload["generator_type"]
     )
-    if checkpoint_payload["model_type"] != "res50":
-        raise ValueError("this runner currently requires a res50 DDSC checkpoint")
     if checkpoint_payload["target"] != -1:
         raise ValueError("this runner currently reports untargeted metrics only")
+    source_model_type = str(checkpoint_payload["model_type"])
+    image_size = int(checkpoint_payload["image_size"])
     eps = float(checkpoint_payload["eps_pixels"]) / 255.0
     generator = generator.to(device).eval()
     generator.requires_grad_(False)
 
-    dataset = build_evaluation_dataset(data_root)
+    dataset = build_evaluation_dataset(data_root, image_size)
     dataset_n = min(len(dataset), args.samples) if args.samples else len(dataset)
     if dataset_n <= 0:
         raise ValueError("ImageNet validation dataset is empty")
@@ -1473,41 +1820,44 @@ def main() -> None:
             f"victim_state_sha256 {name} {victim_sha256}",
             flush=True,
         )
-        if architecture_mode == "egs_tsaa" and name == "res50":
+        if architecture_mode == "egs_tsaa" and name == source_model_type:
             egs_attack_model_contract = attack_model_contract(
                 model,
-                model_type="res50",
+                model_type=source_model_type,
             )
         models[name] = model.to(device=device)
     egs_source_model: torch.nn.Module | None = None
     egs_conditioner: EGSStructuredMask | None = None
     egs_topk_fraction: float | None = None
     if architecture_mode == "egs_tsaa":
-        egs_source_model = models.get("res50")
+        egs_source_model = models.get(source_model_type)
         if egs_source_model is None:
-            egs_source_model = build_model("res50").to(
+            egs_source_model = build_model(source_model_type).to(
                 device="cpu", dtype=torch.float32
             )
             egs_source_model.eval()
             egs_source_model.requires_grad_(False)
             egs_attack_model_contract = attack_model_contract(
                 egs_source_model,
-                model_type="res50",
+                model_type=source_model_type,
             )
             egs_source_model.to(device=device)
         if egs_attack_model_contract is None:
             raise RuntimeError("EGS source-model contract was not initialized")
         egs_topk_fraction = float(checkpoint_payload["architecture"]["egs_tk"])
         actual_conditioner_contract = egs_conditioner_contract(
-            model_type="res50",
-            image_size=224,
+            model_type=source_model_type,
+            image_size=image_size,
             topk_fraction=egs_topk_fraction,
             attack_model_contract=egs_attack_model_contract,
         )
-        validate_egs_conditioner_contract(
-            checkpoint_payload["conditioner_contract"],
-            actual_contract=actual_conditioner_contract,
-        )
+        stored_conditioner_contract = checkpoint_payload.get("conditioner_contract")
+        if stored_conditioner_contract is not None:
+            validate_egs_conditioner_contract(
+                stored_conditioner_contract,
+                actual_contract=actual_conditioner_contract,
+            )
+        checkpoint_payload["conditioner_contract"] = actual_conditioner_contract
 
     contract = state_contract(
         args,
@@ -1565,12 +1915,12 @@ def main() -> None:
             raise RuntimeError("EGS-TSSA conditioner contract was not initialized")
         egs_conditioner = EGSStructuredMask(
             egs_source_model,
-            model_type="res50",
-            image_size=224,
+            model_type=source_model_type,
+            image_size=image_size,
             topk_fraction=egs_topk_fraction,
         )
     try:
-        progress = tqdm(loader, desc="DDSC all model_t", dynamic_ncols=True)
+        progress = tqdm(loader, desc="generator all model_t", dynamic_ncols=True)
         for batch_index, (images, labels) in enumerate(progress, start=1):
             images = images.to(device, dtype=torch.float32, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
@@ -1634,7 +1984,10 @@ def main() -> None:
     )
     elapsed = time.time() - started
     rows = [finalize_model(name, model_metrics[name]) for name in args.models]
-    perturbation = finalize_perturbation(perturbation_metrics, image_size=224)
+    perturbation = finalize_perturbation(
+        perturbation_metrics,
+        image_size=image_size,
+    )
     payload = {
         "status": "complete",
         "contract": contract,
