@@ -49,7 +49,10 @@ class GPGTransferBootstrapTests(unittest.TestCase):
         )
 
         self.assertNotIn("--no-deps", support)
-        self.assertEqual(tuple(support[-3:]), bootstrap.SUPPORT_REQUIREMENTS)
+        self.assertEqual(
+            tuple(support[-len(bootstrap.SUPPORT_REQUIREMENTS) :]),
+            bootstrap.SUPPORT_REQUIREMENTS,
+        )
         self.assertIn("--no-index", support)
         self.assertIn(str(wheelhouse), support)
         self.assertIn("--no-deps", timm)
@@ -82,6 +85,17 @@ class GPGTransferBootstrapTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "yaml.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "mmpretrain").mkdir()
+            (root / "mmpretrain" / "__init__.py").write_text(
+                "def get_model(*args, **kwargs): return None\n",
+                encoding="utf-8",
+            )
+            for package in ("mmcv", "mmengine"):
+                (root / package).mkdir()
+                (root / package / "__init__.py").write_text(
+                    "VALUE = 1\n",
+                    encoding="utf-8",
+                )
             for distribution, version in bootstrap.EXPECTED_DISTRIBUTIONS.items():
                 _write_fake_distribution(
                     root,
@@ -138,6 +152,15 @@ class GPGTransferBootstrapTests(unittest.TestCase):
                 )
             self.assertEqual(destination.read_bytes(), b"wrong")
 
+    def test_mmpretrain_asset_catalog_has_full_matching_hashes(self) -> None:
+        self.assertEqual(len(bootstrap.MMPRETRAIN_CHECKPOINTS), 5)
+        for model_name, spec in bootstrap.MMPRETRAIN_CHECKPOINTS.items():
+            self.assertTrue(model_name.startswith("mm_"))
+            self.assertEqual(len(spec["sha256"]), 64)
+            short_hash = Path(spec["filename"]).stem.rsplit("-", 1)[-1]
+            self.assertTrue(spec["sha256"].startswith(short_hash))
+            self.assertTrue(spec["url"].endswith(spec["filename"]))
+
     def test_existing_asset_symlink_is_rejected(self) -> None:
         payload = b"verified-openmmlab-test-payload"
         expected = hashlib.sha256(payload).hexdigest()
@@ -188,6 +211,9 @@ class GPGTransferBootstrapTests(unittest.TestCase):
         self.assertIn("huggingface-hub==1.24.0", requirements)
         self.assertIn("safetensors==0.8.0", requirements)
         self.assertIn("PyYAML==6.0.3", requirements)
+        self.assertIn("mmpretrain==1.2.0", requirements)
+        self.assertIn("mmengine==0.10.7", requirements)
+        self.assertIn("mmcv-lite==2.2.0", requirements)
         package_lines = [
             line.strip()
             for line in requirements.splitlines()
@@ -208,6 +234,12 @@ class GPGTransferBootstrapTests(unittest.TestCase):
         )
         self.assertIn('--deps-dir "${eval_deps_dir}"', launcher)
         self.assertIn('--vit-checkpoint "${openmmlab_vit_checkpoint}"', launcher)
+        self.assertIn(
+            '--mmpretrain-checkpoint-dir "${mmpretrain_checkpoint_dir}"',
+            launcher,
+        )
+        self.assertIn("mm_deit_small_4xb256_in1k", launcher)
+        self.assertIn("mm_vit_base_p16_32xb128_mae_in1k", launcher)
         self.assertIn('PYTHONPATH="${eval_pythonpath}"', launcher)
         self.assertLess(launcher.index("eval_bootstrap_args=("), launcher.index("trainer_command=("))
 

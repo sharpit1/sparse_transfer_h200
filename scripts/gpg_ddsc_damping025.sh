@@ -7,6 +7,7 @@ trainer="${root}/third_party/GPG/DDSC_GPG_train.py"
 evaluator="${root}/third_party/GPG/tools/evaluate_ddsc_gpg_all_model_t.py"
 eval_bootstrapper="${root}/third_party/GPG/tools/bootstrap_transfer_eval.py"
 openmmlab_vit_checkpoint="${OPENMMLAB_VIT_CHECKPOINT:-${root}/artifacts/pretrained/vit-base-p16_pt-32xb128-mae_in1k_20220623-4c544545.pth}"
+mmpretrain_checkpoint_dir="${MMPRETRAIN_CHECKPOINT_DIR:-${root}/artifacts/pretrained}"
 
 python_bin="${PYTHON:-python}"
 gpu_id="${GPU_ID:-0}"
@@ -35,7 +36,7 @@ eval_num_workers="${EVAL_NUM_WORKERS:-4}"
 eval_samples="${EVAL_SAMPLES:-0}"
 eval_state_every_batches="${EVAL_STATE_EVERY_BATCHES:-25}"
 eval_device="${EVAL_DEVICE:-${device}}"
-default_eval_models="dense161 vgg16 incv3 res50 WideRes50 EffNetB6 deit tnt Swin_Tiny twins vit deit_base tnt_base swin_small swin_base twins_base vit_small vit_base"
+default_eval_models="dense161 vgg16 incv3 res50 WideRes50 EffNetB6 Swin_Tiny vit deit_small deit_base tnt_small tnt_base swin_small swin_base twins_small twins_base vit_small vit_base mm_deit_small_4xb256_in1k mm_tnt_small_p16_3rdparty_in1k mm_swin_tiny_16xb64_in1k mm_twins_pcpvt_small_3rdparty_8xb128_in1k mm_vit_base_p16_32xb128_mae_in1k"
 eval_models="${EVAL_MODELS:-${default_eval_models}}"
 eval_resume="${EVAL_RESUME:-1}"
 auto_install_eval_deps="${AUTO_INSTALL_EVAL_DEPS:-1}"
@@ -68,9 +69,9 @@ Frequency-channel dropout for the GPG attack objective:
 
 EPOCHS is the total target epoch count, not the number of additional epochs.
 All trajectory and runtime settings must match the checkpoint exactly.
-Evaluation defaults to 18 unique victim implementations and requires
+Evaluation defaults to 23 victim implementations and requires
 cached/downloadable pretrained weights. Set EVAL_MODELS to override the list.
-Missing evaluator packages and the OpenMMLab ViT checkpoint are bootstrapped
+Missing evaluator packages and pinned OpenMMLab checkpoints are bootstrapped
 by default. Set AUTO_INSTALL_EVAL_DEPS=0 or AUTO_DOWNLOAD_EVAL_ASSETS=0 to
 require pre-provisioned dependencies or assets instead.
 EOF
@@ -235,6 +236,7 @@ resolve_imagenet_val_dir() {
 val_dir=""
 eval_model_args=()
 eval_model_list=()
+mmpretrain_model_list=()
 eval_pythonpath=""
 if [[ "${run_transfer_eval}" == "1" ]]; then
     val_dir="$(resolve_imagenet_val_dir "${2:-}")" || \
@@ -277,6 +279,15 @@ PY
     else
         for model_name in "${eval_model_list[@]}"; do
             [[ "${model_name}" == "vit" ]] && needs_openmmlab_vit=1
+            case "${model_name}" in
+                mm_deit_small_4xb256_in1k|\
+                mm_tnt_small_p16_3rdparty_in1k|\
+                mm_swin_tiny_16xb64_in1k|\
+                mm_twins_pcpvt_small_3rdparty_8xb128_in1k|\
+                mm_vit_base_p16_32xb128_mae_in1k)
+                    mmpretrain_model_list+=("${model_name}")
+                    ;;
+            esac
         done
     fi
 
@@ -302,6 +313,14 @@ PY
             --require-vit
             --vit-checkpoint "${openmmlab_vit_checkpoint}"
         )
+    fi
+    if (( ${#mmpretrain_model_list[@]} > 0 )); then
+        eval_bootstrap_args+=(
+            --mmpretrain-checkpoint-dir "${mmpretrain_checkpoint_dir}"
+        )
+        for model_name in "${mmpretrain_model_list[@]}"; do
+            eval_bootstrap_args+=(--require-mmpretrain-model "${model_name}")
+        done
     fi
     pip_cache_dir="${PIP_CACHE_DIR:-${root}/.cache/pip}"
     mkdir -p -- "${pip_cache_dir}" "${eval_deps_dir}"
@@ -384,6 +403,7 @@ export CUDA_VISIBLE_DEVICES="${gpu_id}"
 export TORCH_HOME="${TORCH_HOME:-${root}/.cache/torch}"
 export HF_HOME="${HF_HOME:-${root}/.cache/huggingface}"
 export OPENMMLAB_VIT_CHECKPOINT="${openmmlab_vit_checkpoint}"
+export MMPRETRAIN_CHECKPOINT_DIR="${mmpretrain_checkpoint_dir}"
 export PYTHONHASHSEED=42
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
@@ -477,7 +497,7 @@ inference_checkpoint="${training_output_path}/DDSC_gpg_res50_epoch_${final_epoch
 [[ -f "${inference_checkpoint}" ]] || \
     fail "Final inference checkpoint is missing: ${inference_checkpoint}"
 
-eval_out_dir="${EVAL_OUT_DIR:-${training_output_path}/transfer_asr_18models}"
+eval_out_dir="${EVAL_OUT_DIR:-${training_output_path}/transfer_asr_23models}"
 mkdir -p -- "${eval_out_dir}"
 eval_resume_args=()
 if [[ "${eval_resume}" == "0" ]]; then
@@ -488,6 +508,7 @@ evaluator_command=(
     --checkpoint "${inference_checkpoint}"
     --imagenet-val-root "${val_dir}"
     --out-dir "${eval_out_dir}"
+    --mmpretrain-checkpoint-dir "${mmpretrain_checkpoint_dir}"
     "${eval_model_args[@]}"
     --batch-size "${eval_batch_size}"
     --num-workers "${eval_num_workers}"
