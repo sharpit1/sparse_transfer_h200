@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -61,6 +62,59 @@ from generators_ddsc_gpg import module_state_sha256  # noqa: E402
 from generators_modify import GeneratorResnet as GPGGeneratorResnet  # noqa: E402
 
 
+MMPRETRAIN_MODEL_SPECS = {
+    "mm_deit_small_4xb256_in1k": {
+        "model_name": "deit-small_4xb256_in1k",
+        "checkpoint_filename": (
+            "deit-small_pt-4xb256_in1k_20220218-9425b9bb.pth"
+        ),
+        "checkpoint_sha256": (
+            "9425b9bb3abe0280d9884e8d5f2719544bb41d7f2ee0f7f0faaf6d274fef97b3"
+        ),
+    },
+    "mm_tnt_small_p16_3rdparty_in1k": {
+        "model_name": "tnt-small-p16_3rdparty_in1k",
+        "checkpoint_filename": (
+            "tnt-small-p16_3rdparty_in1k_20210903-c56ee7df.pth"
+        ),
+        "checkpoint_sha256": (
+            "c56ee7dfe9b7f128021aeb0aaca9a4e7facf65f08382aa9dc9eb43b4c75a3635"
+        ),
+    },
+    "mm_swin_tiny_16xb64_in1k": {
+        "model_name": "swin-tiny_16xb64_in1k",
+        "checkpoint_filename": (
+            "swin_tiny_224_b16x64_300e_imagenet_20210616_090925-66df6be6.pth"
+        ),
+        "checkpoint_sha256": (
+            "66df6be60934ef43e368690bf2d7d60b0dad6d945a44e51660551bd452eacc3a"
+        ),
+    },
+    "mm_twins_pcpvt_small_3rdparty_8xb128_in1k": {
+        "model_name": "twins-pcpvt-small_3rdparty_8xb128_in1k",
+        "checkpoint_filename": (
+            "twins-pcpvt-small_3rdparty_8xb128_in1k_20220126-ef23c132.pth"
+        ),
+        "checkpoint_sha256": (
+            "ef23c132078a8355a6c5705cd57e1f24cf356e8b1b44ea8d245abf2f40a130b3"
+        ),
+    },
+    "mm_vit_base_p16_32xb128_mae_in1k": {
+        "model_name": "vit-base-p16_32xb128-mae_in1k",
+        "checkpoint_filename": (
+            "vit-base-p16_pt-32xb128-mae_in1k_20220623-4c544545.pth"
+        ),
+        "checkpoint_sha256": (
+            "4c544545d50657b87c62ca2de1a5da8d5f12abfc80e386bfb9a37dfbdf5b3e08"
+        ),
+    },
+}
+MMPRETRAIN_DISTRIBUTIONS = {
+    "mmpretrain": "1.2.0",
+    "mmengine": "0.10.7",
+    "mmcv-lite": "2.2.0",
+}
+
 MODEL_ORDER = (
     "dense161",
     "vgg16",
@@ -68,10 +122,7 @@ MODEL_ORDER = (
     "res50",
     "WideRes50",
     "EffNetB6",
-    "deit",
-    "tnt",
     "Swin_Tiny",
-    "twins",
     "vit",
     "deit_small",
     "deit_base",
@@ -83,6 +134,7 @@ MODEL_ORDER = (
     "twins_base",
     "vit_small",
     "vit_base",
+    *MMPRETRAIN_MODEL_SPECS,
 )
 
 MODEL_IMPLEMENTATIONS = {
@@ -92,10 +144,7 @@ MODEL_IMPLEMENTATIONS = {
     "res50": "torchvision.resnet50/IMAGENET1K_V1",
     "WideRes50": "torchvision.wide_resnet50_2/IMAGENET1K_V1",
     "EffNetB6": "torchvision.efficientnet_b6/IMAGENET1K_V1",
-    "deit": "timm/deit_small_patch16_224.fb_in1k",
-    "tnt": "timm/tnt_s_patch16_224.in1k",
     "Swin_Tiny": "timm/swin_tiny_patch4_window7_224.ms_in1k",
-    "twins": "timm/twins_pcpvt_small.in1k",
     "vit": "OpenMMLab/vit-base-p16_32xb128-mae_in1k",
     "deit_small": "timm/deit_small_patch16_224.fb_in1k",
     "deit_base": "timm/deit_base_patch16_224.fb_in1k",
@@ -107,6 +156,10 @@ MODEL_IMPLEMENTATIONS = {
     "twins_base": "timm/twins_pcpvt_base.in1k",
     "vit_small": "timm/vit_small_patch16_224.augreg_in21k_ft_in1k",
     "vit_base": "timm/vit_base_patch16_224.augreg_in21k_ft_in1k",
+    **{
+        key: f"mmpretrain==1.2.0/{spec['model_name']}"
+        for key, spec in MMPRETRAIN_MODEL_SPECS.items()
+    },
 }
 
 _DEFAULT_OPENMMLAB_MAE_VIT_CHECKPOINT = (
@@ -124,11 +177,17 @@ OPENMMLAB_MAE_VIT_CHECKPOINT = Path(
 OPENMMLAB_MAE_VIT_SHA256 = (
     "4c544545d50657b87c62ca2de1a5da8d5f12abfc80e386bfb9a37dfbdf5b3e08"
 )
+MMPRETRAIN_CHECKPOINT_DIR = Path(
+    os.environ.get(
+        "MMPRETRAIN_CHECKPOINT_DIR",
+        str(REPO_ROOT / "artifacts" / "pretrained"),
+    )
+).expanduser()
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 PROGRESS_STATE_SCHEMA = 3
-EVALUATION_CONTRACT_SCHEMA = 4
+EVALUATION_CONTRACT_SCHEMA = 5
 METRICS_SCHEMA = 1
 RAW_ARCHITECTURE_MODES = ("gpg", "tsaa", "egs_tsaa", "egs_tssa")
 
@@ -194,6 +253,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--imagenet-val-root", required=True)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument(
+        "--mmpretrain-checkpoint-dir",
+        type=Path,
+        default=MMPRETRAIN_CHECKPOINT_DIR,
+        help=(
+            "directory containing the pinned MMPretrain checkpoints; "
+            "defaults to MMPRETRAIN_CHECKPOINT_DIR or artifacts/pretrained"
+        ),
+    )
     parser.add_argument(
         "--models", nargs="+", choices=MODEL_ORDER, default=list(MODEL_ORDER)
     )
@@ -546,7 +614,117 @@ def build_openmmlab_mae_vit() -> torch.nn.Module:
     return model
 
 
-def build_model(name: str) -> torch.nn.Module:
+def _mmpretrain_distribution_versions() -> dict[str, str]:
+    actual: dict[str, str] = {}
+    for distribution, expected_version in MMPRETRAIN_DISTRIBUTIONS.items():
+        try:
+            actual_version = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise RuntimeError(
+                "MMPretrain victim models require the pinned evaluation "
+                f"dependency {distribution}=={expected_version}"
+            ) from exc
+        if actual_version != expected_version:
+            raise RuntimeError(
+                "MMPretrain evaluation dependency version mismatch: "
+                f"expected {distribution}=={expected_version}, "
+                f"found {actual_version}"
+            )
+        actual[distribution] = actual_version
+    return actual
+
+
+def mmpretrain_checkpoint_path(
+    name: str,
+    checkpoint_dir: str | os.PathLike[str],
+) -> Path:
+    try:
+        spec = MMPRETRAIN_MODEL_SPECS[name]
+    except KeyError as exc:
+        raise ValueError(f"unsupported MMPretrain model_t: {name}") from exc
+    directory = Path(checkpoint_dir).expanduser().resolve()
+    checkpoint_path = directory / spec["checkpoint_filename"]
+    try:
+        checkpoint_path.relative_to(directory)
+    except ValueError as exc:  # pragma: no cover - constant filename guard
+        raise RuntimeError("MMPretrain checkpoint path escapes its directory") from exc
+    return checkpoint_path
+
+
+def build_mmpretrain_model(
+    name: str,
+    checkpoint_dir: str | os.PathLike[str],
+) -> torch.nn.Module:
+    """Load one pinned MMPretrain classifier from a verified local asset."""
+
+    spec = MMPRETRAIN_MODEL_SPECS[name]
+    checkpoint_path = mmpretrain_checkpoint_path(name, checkpoint_dir)
+    if checkpoint_path.is_symlink():
+        raise RuntimeError(
+            f"MMPretrain checkpoint must not be a symbolic link: {checkpoint_path}"
+        )
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            "missing MMPretrain checkpoint; set --mmpretrain-checkpoint-dir "
+            f"or MMPRETRAIN_CHECKPOINT_DIR: {checkpoint_path}"
+        )
+    actual_sha256 = sha256_file(checkpoint_path)
+    expected_sha256 = spec["checkpoint_sha256"]
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            "MMPretrain checkpoint hash mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}, "
+            f"path={checkpoint_path}"
+        )
+
+    _mmpretrain_distribution_versions()
+    try:
+        from mmpretrain import get_model
+    except ImportError as exc:  # pragma: no cover - dependency probe catches this
+        raise RuntimeError(
+            "MMPretrain is unavailable; install requirements-transfer-eval.txt"
+        ) from exc
+    model = get_model(
+        spec["model_name"],
+        pretrained=str(checkpoint_path),
+        device="cpu",
+    )
+    if not isinstance(model, torch.nn.Module):
+        raise RuntimeError("mmpretrain.get_model did not return a torch module")
+    return model
+
+
+def mmpretrain_victim_contract(
+    models: list[str] | tuple[str, ...],
+    checkpoint_dir: str | os.PathLike[str],
+) -> dict[str, Any]:
+    selected = [name for name in models if name in MMPRETRAIN_MODEL_SPECS]
+    if not selected:
+        return {"schema": 1, "packages": {}, "models": []}
+    packages = _mmpretrain_distribution_versions()
+    entries = []
+    for name in selected:
+        spec = MMPRETRAIN_MODEL_SPECS[name]
+        entries.append(
+            {
+                "name": name,
+                "model_name": spec["model_name"],
+                "checkpoint_path": str(
+                    mmpretrain_checkpoint_path(name, checkpoint_dir)
+                ),
+                "checkpoint_sha256": spec["checkpoint_sha256"],
+            }
+        )
+    return {"schema": 1, "packages": packages, "models": entries}
+
+
+def build_model(
+    name: str,
+    *,
+    mmpretrain_checkpoint_dir: str | os.PathLike[str] = MMPRETRAIN_CHECKPOINT_DIR,
+) -> torch.nn.Module:
+    if name in MMPRETRAIN_MODEL_SPECS:
+        return build_mmpretrain_model(name, mmpretrain_checkpoint_dir)
     if name == "dense161":
         return torchvision.models.densenet161(
             weights=torchvision.models.DenseNet161_Weights.IMAGENET1K_V1
@@ -574,10 +752,7 @@ def build_model(name: str) -> torch.nn.Module:
     if name == "vit":
         return build_openmmlab_mae_vit()
     timm_names = {
-        "deit": "deit_small_patch16_224.fb_in1k",
-        "tnt": "tnt_s_patch16_224.in1k",
         "Swin_Tiny": "swin_tiny_patch4_window7_224.ms_in1k",
-        "twins": "twins_pcpvt_small.in1k",
         "deit_small": "deit_small_patch16_224.fb_in1k",
         "deit_base": "deit_base_patch16_224.fb_in1k",
         "tnt_small": "tnt_s_patch16_224.in1k",
@@ -1282,6 +1457,14 @@ def state_contract(
             "checkpoint_path": str(OPENMMLAB_MAE_VIT_CHECKPOINT.resolve()),
             "expected_sha256": OPENMMLAB_MAE_VIT_SHA256,
         },
+        "mmpretrain_victims": mmpretrain_victim_contract(
+            list(args.models),
+            getattr(
+                args,
+                "mmpretrain_checkpoint_dir",
+                MMPRETRAIN_CHECKPOINT_DIR,
+            ),
+        ),
         "input_transform": input_transform_contract(
             int(checkpoint_payload["image_size"])
         ),
@@ -1805,13 +1988,17 @@ def main() -> None:
     dataset_manifest = ordered_dataset_manifest(dataset, data_root, dataset_n)
     print(f"dataset_n={dataset_n} classes={len(dataset.classes)}", flush=True)
     print(f"models={list(args.models)}", flush=True)
+    mmpretrain_checkpoint_dir = Path(args.mmpretrain_checkpoint_dir).resolve()
     models: dict[str, torch.nn.Module] = {}
     victim_model_contracts: dict[str, dict[str, Any]] = {}
     victim_model_execution_contracts: dict[str, dict[str, Any]] = {}
     egs_attack_model_contract: dict[str, Any] | None = None
     for name in args.models:
         print(f"loading_model {name} {MODEL_IMPLEMENTATIONS[name]}", flush=True)
-        model = build_model(name).to(device="cpu", dtype=torch.float32).eval()
+        model = build_model(
+            name,
+            mmpretrain_checkpoint_dir=mmpretrain_checkpoint_dir,
+        ).to(device="cpu", dtype=torch.float32).eval()
         model.requires_grad_(False)
         victim_model_contracts[name] = victim_model_state_contract(model)
         victim_model_execution_contracts[name] = victim_model_execution_contract(model)
