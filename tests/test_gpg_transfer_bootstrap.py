@@ -227,6 +227,11 @@ class GPGTransferBootstrapTests(unittest.TestCase):
         launcher = (ROOT / "scripts" / "gpg_ddsc_damping025.sh").read_text(
             encoding="utf-8"
         )
+        self.assertIn('architecture_mode="${ARCHITECTURE_MODE:-gpg}"', launcher)
+        self.assertIn('decoder_mode="${DECODER_MODE:-}"', launcher)
+        self.assertIn('--architecture_mode "${architecture_mode}"', launcher)
+        self.assertIn('decoder_args+=(--decoder_mode "${decoder_mode}")', launcher)
+        self.assertIn('"${architecture_mode}" != "simple"', launcher)
         self.assertIn('auto_install_eval_deps="${AUTO_INSTALL_EVAL_DEPS:-1}"', launcher)
         self.assertIn(
             'auto_download_eval_assets="${AUTO_DOWNLOAD_EVAL_ASSETS:-1}"',
