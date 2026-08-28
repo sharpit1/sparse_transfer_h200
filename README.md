@@ -4,24 +4,49 @@ This repository packages the three-mode DDSC-GPG trainer and a licensed
 16-image NIPS2017 subset for reproducible GPU smoke testing. Two launchers use
 the same data and optimization settings while changing only DDSC damping.
 
-## Architecture-mode GPG training and transfer ASR
+## Architecture-mode DDSC training and transfer ASR
 
 `scripts/gpg_ddsc_damping025.sh` runs the full original GPG architecture under
-the DDSC controller and then evaluates transfer ASR. Its fixed defaults are
-batch size 16, 15 total epochs, two warm-up epochs, lambda-1 `0.0001` after
-warm-up, DDSC damping `0.25`, and transfer-evaluation batch size 128. The
-default victim list contains 18 unique implementations; the reported transfer
-macro mean excludes the source `res50` and therefore averages 17 victims.
+the DDSC controller by default and then evaluates transfer ASR. Set
+`ARCHITECTURE_MODE=simple` to use the frozen ResNet-50 layer1 encoder and set
+`DECODER_MODE=shared` or `split` to select its decoder topology. The defaults
+remain `ARCHITECTURE_MODE=gpg` for backward compatibility; `DECODER_MODE` is
+valid only for `simple` and defaults to `shared` in that mode. Other fixed
+defaults are batch size 16, 15 total epochs, two warm-up epochs, lambda-1
+`0.0001` after warm-up, DDSC damping `0.25`, and transfer-evaluation batch size
+128. The default victim list contains 23 unique implementations; the reported
+transfer macro mean excludes the source `res50` and therefore averages 22
+victims.
 
 ```bash
 bash scripts/gpg_ddsc_damping025.sh /app/data/ImageNet-2012/train /app/data/ImageNet-2012/val
 ```
 
+For shared-lite frequency-channel Dropout-EOT with probability 0.7, warm-up 2,
+and damping 0.5:
+
+```bash
+ARCHITECTURE_MODE=simple \
+DECODER_MODE=shared \
+DDSC_DAMPING=0.5 \
+LAYER1_DROPOUT_MODE=frequency_channel \
+LAYER1_DROPOUT_P=0.7 \
+LAYER1_DROPOUT_CHANNEL_RATIO=0.3 \
+LAYER1_DROPOUT_HF_RATIO=0.35 \
+LAYER1_DROPOUT_EOT_SAMPLES=4 \
+LAYER1_DROPOUT_EOT_REDUCTION=logits \
+OUT_ROOT=/app/output/ddsc_drop_p07_w2_d05_shared_lite \
+bash scripts/gpg_ddsc_damping025.sh \
+  /app/data/ImageNet-2012/train \
+  /app/data/ImageNet-2012/val
+```
+
 The two warm-up epochs apply lambda-1 `0`; epoch 3 starts at
 `0.0001`, after which DDSC updates it once per epoch. Set
-`RUN_TRANSFER_EVAL=0` for training only. A continuation requires an
-architecture-mode GPG `.train.pth`; a legacy `GN_res50_*.pth` is not a DDSC
-continuation checkpoint.
+`RUN_TRANSFER_EVAL=0` for training only. A continuation requires a DDSC
+`.train.pth` whose architecture and decoder mode match `ARCHITECTURE_MODE` and
+`DECODER_MODE`; a legacy `GN_res50_*.pth` is not a DDSC continuation
+checkpoint.
 
 The transfer evaluator downloads torchvision/timm weights through their
 standard caches. Set `TORCH_HOME` and `HF_HOME` to pre-populated locations for

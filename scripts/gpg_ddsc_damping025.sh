@@ -12,7 +12,9 @@ mmpretrain_checkpoint_dir="${MMPRETRAIN_CHECKPOINT_DIR:-${root}/artifacts/pretra
 python_bin="${PYTHON:-python}"
 gpu_id="${GPU_ID:-0}"
 device="${DEVICE:-cuda:0}"
-out_root="${OUT_ROOT:-/app/output/gpg_ddsc_lam1_0001}"
+architecture_mode="${ARCHITECTURE_MODE:-gpg}"
+decoder_mode="${DECODER_MODE:-}"
+out_root="${OUT_ROOT:-/app/output/${architecture_mode}_ddsc_lam1_0001}"
 epochs="${EPOCHS:-15}"
 batch_size="${BATCH_SIZE:-16}"
 num_workers="${NUM_WORKERS:-8}"
@@ -67,6 +69,11 @@ Frequency-channel dropout for the GPG attack objective:
   LAYER1_DROPOUT_MODE=frequency_channel \
   LAYER1_DROPOUT_EOT_REDUCTION=loss bash $0 [train-dir] [val-dir]
 
+Shared-lite decoder with logits-reduced Dropout-EOT:
+  ARCHITECTURE_MODE=simple DECODER_MODE=shared \
+  LAYER1_DROPOUT_MODE=frequency_channel \
+  LAYER1_DROPOUT_EOT_REDUCTION=logits bash $0 [train-dir] [val-dir]
+
 EPOCHS is the total target epoch count, not the number of additional epochs.
 All trajectory and runtime settings must match the checkpoint exactly.
 Evaluation defaults to 23 victim implementations and requires
@@ -79,6 +86,20 @@ EOF
 }
 
 [[ "$#" -le 2 ]] || usage
+case "${architecture_mode}" in
+    simple|gpg) ;;
+    *) fail "ARCHITECTURE_MODE must be simple or gpg" ;;
+esac
+if [[ "${architecture_mode}" == "simple" ]]; then
+    decoder_mode="${decoder_mode:-shared}"
+    case "${decoder_mode}" in
+        shared|split) ;;
+        *) fail "DECODER_MODE must be shared or split" ;;
+    esac
+elif [[ -n "${decoder_mode}" ]]; then
+    fail "DECODER_MODE is valid only when ARCHITECTURE_MODE=simple"
+fi
+decoder_mode_label="${decoder_mode:-n/a}"
 case "${load_cp}" in
     New|Continue) ;;
     *) fail "LOAD_CP must be New or Continue" ;;
@@ -107,7 +128,8 @@ case "${layer1_dropout_eot_reduction}" in
     logits|loss) ;;
     *) fail "LAYER1_DROPOUT_EOT_REDUCTION must be logits or loss" ;;
 esac
-if [[ "${layer1_dropout_mode}" == "frequency_channel" \
+if [[ "${architecture_mode}" != "simple" \
+    && "${layer1_dropout_mode}" == "frequency_channel" \
     && "${layer1_dropout_eot_reduction}" != "loss" ]]; then
     fail "GPG frequency-channel dropout requires LAYER1_DROPOUT_EOT_REDUCTION=loss"
 fi
@@ -339,7 +361,7 @@ if [[ "${load_cp}" == "Continue" ]]; then
         fail "CP_PATH must be a DDSC training sidecar ending in .train.pth"
 
     "${python_bin}" - "${cp_path}" "${lambda1_init}" \
-        "${ddsc_restoring_gain}" <<'PY'
+        "${ddsc_restoring_gain}" "${architecture_mode}" "${decoder_mode}" <<'PY'
 import math
 import sys
 
@@ -348,6 +370,8 @@ import torch
 checkpoint_path = sys.argv[1]
 requested_lambda1 = float(sys.argv[2])
 requested_gain_text = sys.argv[3]
+requested_architecture_mode = sys.argv[4]
+requested_decoder_mode = sys.argv[5]
 try:
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 except TypeError:
@@ -362,8 +386,21 @@ if checkpoint_format not in {"ddsc_gpg_training_v8", "ddsc_gpg_training_v9"}:
 if not isinstance(payload, dict) or payload.get("kind") != "training":
     raise SystemExit("CP_PATH does not contain a DDSC training payload")
 train_args = payload.get("train_args")
-if not isinstance(train_args, dict) or train_args.get("architecture_mode") != "gpg":
-    raise SystemExit("CP_PATH was not created with architecture_mode=gpg")
+if not isinstance(train_args, dict):
+    raise SystemExit("CP_PATH does not contain training arguments")
+stored_architecture_mode = train_args.get("architecture_mode")
+if stored_architecture_mode != requested_architecture_mode:
+    raise SystemExit(
+        "ARCHITECTURE_MODE must equal the checkpoint value: "
+        f"stored={stored_architecture_mode!r}, requested={requested_architecture_mode!r}"
+    )
+if requested_architecture_mode == "simple":
+    stored_decoder_mode = train_args.get("decoder_mode", "shared")
+    if stored_decoder_mode != requested_decoder_mode:
+        raise SystemExit(
+            "DECODER_MODE must equal the checkpoint value: "
+            f"stored={stored_decoder_mode!r}, requested={requested_decoder_mode!r}"
+        )
 stored_lambda1 = train_args.get("lam_1")
 if not isinstance(stored_lambda1, (int, float)) or not math.isclose(
     float(stored_lambda1), requested_lambda1, rel_tol=0.0, abs_tol=0.0
@@ -410,7 +447,8 @@ export PYTHONFAULTHANDLER=1
 
 mkdir -p -- "${TORCH_HOME}" "${HF_HOME}" "${out_root}"
 
-printf 'architecture_mode=gpg\n'
+printf 'architecture_mode=%s decoder_mode=%s\n' \
+    "${architecture_mode}" "${decoder_mode_label}"
 printf 'imagenet_train_dir=%s\n' "${train_dir}"
 printf 'load_cp=%s checkpoint=%s\n' "${load_cp}" "${cp_path:-none}"
 printf 'epochs_total=%s batch_size=%s lambda1_init=%s\n' \
@@ -427,11 +465,15 @@ if [[ "${run_transfer_eval}" == "1" ]]; then
         "${val_dir}" "${eval_device}" "${eval_samples}"
 fi
 
+decoder_args=()
+if [[ "${architecture_mode}" == "simple" ]]; then
+    decoder_args+=(--decoder_mode "${decoder_mode}")
+fi
 trainer_command=(
     "${python_bin}" -u "${trainer}"
     --train_dir "${train_dir}"
     --model_type res50
-    --architecture_mode gpg
+    --architecture_mode "${architecture_mode}"
     --eps 10
     --target -1
     --batch_size "${batch_size}"
@@ -453,7 +495,7 @@ trainer_command=(
     --decoder_width 128
     --decoder_num_blocks 3
     --decoder_upsample_backend transpose
-    --decoder_mode shared
+    "${decoder_args[@]}"
     --layer1_dropout_mode "${layer1_dropout_mode}"
     --layer1_dropout_p "${layer1_dropout_p}"
     --layer1_dropout_channel_ratio "${layer1_dropout_channel_ratio}"
@@ -472,7 +514,7 @@ trainer_command=(
 )
 
 run_stamp="$(date +%Y%m%d_%H%M%S)"
-train_stdout_log="${out_root}/gpg_ddsc_damping025_train_${run_stamp}.stdout.log"
+train_stdout_log="${out_root}/${architecture_mode}_${decoder_mode_label}_ddsc_train_${run_stamp}.stdout.log"
 printf 'trainer_command='
 printf '%q ' "${trainer_command[@]}"
 printf '\ntrain_stdout_log=%s\n' "${train_stdout_log}"
