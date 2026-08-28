@@ -80,6 +80,202 @@ class ArchitectureModeContractTests(unittest.TestCase):
         ddsc_train.validate_args(alias)
         self.assertEqual(alias.architecture_mode, "egs_tsaa")
 
+    def test_temporal_intersection_options_cover_all_architecture_modes(self) -> None:
+        parser = ddsc_train.build_parser()
+        for mode in ("simple", "gpg", "tsaa", "egs_tsaa"):
+            device = "cuda" if mode in {"tsaa", "egs_tsaa"} else "cpu"
+            args = parser.parse_args(
+                [
+                    "--device",
+                    device,
+                    "--architecture_mode",
+                    mode,
+                    "--intersection_reg_mode",
+                    "normalized_l2",
+                    "--intersection_reg_lambda",
+                    "0.25",
+                ]
+            )
+            ddsc_train.validate_args(args)
+            self.assertEqual(args.intersection_reg_mode, "normalized_l2")
+            self.assertEqual(args.intersection_reg_lambda, 0.25)
+
+        invalid_enabled = parser.parse_args(
+            ["--intersection_reg_mode", "normalized_l2"]
+        )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            ddsc_train.validate_args(invalid_enabled)
+        invalid_disabled = parser.parse_args(["--intersection_reg_lambda", "0.1"])
+        with self.assertRaisesRegex(ValueError, "must be zero"):
+            ddsc_train.validate_args(invalid_disabled)
+        invalid_eps = parser.parse_args(["--intersection_reg_eps", "0"])
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            ddsc_train.validate_args(invalid_eps)
+
+    def test_intersection_regularization_starts_two_epochs_after_warmup(
+        self,
+    ) -> None:
+        self.assertEqual(ddsc_train.INTERSECTION_REGULARIZATION_DELAY_EPOCHS, 2)
+        for epoch in range(4):
+            self.assertFalse(
+                ddsc_train.intersection_regularization_active(
+                    epoch,
+                    warmup_epochs=2,
+                )
+            )
+        self.assertTrue(
+            ddsc_train.intersection_regularization_active(
+                4,
+                warmup_epochs=2,
+            )
+        )
+        self.assertTrue(
+            ddsc_train.intersection_regularization_active(
+                5,
+                warmup_epochs=2,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "epoch must be"):
+            ddsc_train.intersection_regularization_active(-1, warmup_epochs=2)
+        with self.assertRaisesRegex(ValueError, "warmup_epochs must be"):
+            ddsc_train.intersection_regularization_active(0, warmup_epochs=-1)
+
+    def test_v9_checkpoint_args_default_temporal_intersection_to_off(self) -> None:
+        train_args = vars(ddsc_train.build_parser().parse_args([]))
+        for key in ddsc_train.INTERSECTION_REGULARIZATION_DEFAULTS:
+            train_args.pop(key)
+        normalized = ddsc_train._normalize_checkpoint_train_args(
+            train_args,
+            checkpoint_format=ddsc_train.PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT,
+        )
+        for key, value in ddsc_train.INTERSECTION_REGULARIZATION_DEFAULTS.items():
+            self.assertEqual(normalized[key], value)
+
+        with self.assertRaisesRegex(ValueError, "v11.*incomplete"):
+            ddsc_train._normalize_checkpoint_train_args(
+                train_args,
+                checkpoint_format=ddsc_train.CHECKPOINT_FORMAT,
+            )
+        ambiguous_v9 = dict(normalized)
+        with self.assertRaisesRegex(ValueError, "must not contain v10\\+"):
+            ddsc_train._normalize_checkpoint_train_args(
+                ambiguous_v9,
+                checkpoint_format=(
+                    ddsc_train.PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT
+                ),
+            )
+
+    def test_normalized_temporal_intersection_has_exploratory_gradient(self) -> None:
+        current = torch.tensor(
+            [[[[0.8, 0.2]]]], dtype=torch.float64, requires_grad=True
+        )
+        previous = torch.tensor(
+            [[[[1.0, 0.0]]]], dtype=torch.float64, requires_grad=True
+        )
+        loss = ddsc_train.normalized_temporal_intersection_loss(
+            current,
+            previous,
+            eps=1.0e-12,
+        )
+        loss.backward()
+        self.assertAlmostEqual(float(loss), 0.64 / 0.68, places=6)
+        self.assertGreater(float(current.grad[0, 0, 0, 0]), 0.0)
+        self.assertLess(float(current.grad[0, 0, 0, 1]), 0.0)
+        self.assertIsNone(previous.grad)
+
+    def test_temporal_intersection_uses_hard_previous_support_and_batch_sum(
+        self,
+    ) -> None:
+        current = torch.tensor(
+            [
+                [[[0.8, 0.2]]],
+                [[[0.8, 0.2]]],
+            ],
+            requires_grad=True,
+        )
+        previous = torch.tensor(
+            [
+                [[[0.51, 0.49]]],
+                [[[0.99, 0.01]]],
+            ],
+            requires_grad=True,
+        )
+        loss = ddsc_train.normalized_temporal_intersection_loss(
+            current,
+            previous,
+            eps=1.0e-12,
+        )
+        self.assertAlmostEqual(float(loss), 2.0 * 0.64 / 0.68, places=6)
+        loss.backward()
+        self.assertTrue(torch.all(current.grad[:, 0, 0, 0] > 0.0))
+        self.assertTrue(torch.all(current.grad[:, 0, 0, 1] < 0.0))
+        self.assertIsNone(previous.grad)
+
+        half_current = current.detach().half().requires_grad_(True)
+        half_loss = ddsc_train.normalized_temporal_intersection_loss(
+            half_current,
+            previous.detach().half(),
+            eps=1.0e-12,
+        )
+        self.assertEqual(half_loss.dtype, torch.float32)
+        half_loss.backward()
+        self.assertTrue(torch.isfinite(half_current.grad).all())
+
+    def test_temporal_overlap_uses_deployed_egs_support(self) -> None:
+        continuous = torch.tensor(
+            [[[[0.9, 0.8], [0.7, 0.6]]]], requires_grad=True
+        )
+        structured = torch.tensor(
+            [[[[1.0, 0.0], [0.0, 1.0]]]], requires_grad=True
+        )
+        self.assertIs(
+            ddsc_train.temporal_overlap_mask("gpg", continuous),
+            continuous,
+        )
+        overlap = ddsc_train.temporal_overlap_mask(
+            "egs_tsaa",
+            continuous,
+            structured_mask=structured,
+        )
+        self.assertTrue(torch.equal(overlap, continuous * structured))
+        overlap.sum().backward()
+        self.assertTrue(torch.equal(continuous.grad, structured.detach()))
+        self.assertIsNone(structured.grad)
+
+    def test_frozen_generator_snapshot_is_independent_and_gradient_free(self) -> None:
+        generator = nn.Sequential(
+            nn.BatchNorm2d(1),
+            nn.Dropout(p=0.5),
+            nn.Conv2d(1, 1, kernel_size=1),
+        ).train()
+        generator[0].eval()
+        generator.evaluate = False
+        expected_training = tuple(module.training for module in generator.modules())
+        with ddsc_train.generator_deployment_mask_mode(generator):
+            self.assertTrue(all(not module.training for module in generator.modules()))
+            self.assertTrue(generator.evaluate)
+            self.assertTrue(
+                all(parameter.requires_grad for parameter in generator.parameters())
+            )
+        self.assertEqual(
+            tuple(module.training for module in generator.modules()),
+            expected_training,
+        )
+        self.assertFalse(generator.evaluate)
+
+        snapshot = ddsc_train.frozen_generator_snapshot(generator)
+        self.assertIsNot(snapshot, generator)
+        self.assertFalse(snapshot.training)
+        self.assertTrue(snapshot.evaluate)
+        self.assertTrue(
+            all(not parameter.requires_grad for parameter in snapshot.parameters())
+        )
+        for original, frozen in zip(
+            generator.state_dict().values(), snapshot.state_dict().values()
+        ):
+            self.assertTrue(torch.equal(original, frozen))
+            self.assertNotEqual(original.data_ptr(), frozen.data_ptr())
+
     def test_non_simple_frequency_dropout_requires_member_loss_average(self) -> None:
         parser = ddsc_train.build_parser()
         invalid = parser.parse_args(
@@ -169,6 +365,25 @@ class ArchitectureModeContractTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(adv).all())
         self.assertIn("feature_guidance", auxiliary)
         self.assertEqual(auxiliary["feature_guidance"].ndim, 0)
+
+        training_flags = tuple(module.training for module in gpg.modules())
+        rng_before = torch.get_rng_state().clone()
+        with ddsc_train.generator_deployment_mask_mode(gpg):
+            deployment_mask = forward_generator_training(
+                gpg,
+                "gpg",
+                image,
+                0.1,
+                pgd_delta=delta,
+            )[3]
+            self.assertTrue(gpg.evaluate)
+            self.assertTrue(deployment_mask.requires_grad)
+        self.assertEqual(
+            tuple(module.training for module in gpg.modules()),
+            training_flags,
+        )
+        self.assertFalse(gpg.evaluate)
+        self.assertTrue(torch.equal(torch.get_rng_state(), rng_before))
 
         # The unmodified TSAA/EGS-TSSA training sources hard-code CUDA for the
         # stochastic branch. Their evaluate=True source classes are device-safe.
