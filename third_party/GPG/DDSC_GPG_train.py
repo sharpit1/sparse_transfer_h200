@@ -6,8 +6,10 @@ left untouched.  The intended method changes are limited to:
 1. adapt the sparse-loss multiplier lambda-1 once per controlled epoch from
    the observed binary spatial support; and
 2. select the parameter-reduced ``simple`` generator or the vendored GPG,
-   TSAA, or EGS-TSSA generator and preserve its source loss terms; and
-3. optionally regularize only the attack-objective ResNet-50 with isolated
+   TSAA, or EGS-TSSA generator and preserve its source loss terms;
+3. optionally penalize current deployment-mode mask energy on the frozen
+   previous epoch's deployed hard support; and
+4. optionally regularize only the attack-objective ResNet-50 with isolated
    layer1 frequency-channel dropout and clean-inclusive EOT.  The clean-label
    path and every generator remain isolated from this classifier dropout.
 
@@ -19,6 +21,7 @@ from mean-loss DDSC experiments must not be copied directly into this trainer.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import logging
@@ -30,6 +33,7 @@ import threading
 import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -115,14 +119,17 @@ except ImportError:
 
 LOGGER = logging.getLogger("ddsc_gpg")
 _RUN_TRAINING_LOCK = threading.Lock()
-CHECKPOINT_FORMAT = "ddsc_gpg_training_v9"
-PREVIOUS_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v8"
+CHECKPOINT_FORMAT = "ddsc_gpg_training_v11"
+PREVIOUS_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v10"
+PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v9"
+ARCHITECTURE_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v8"
 LAYER1_DROPOUT_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v7"
 LEGACY_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v6"
 INFERENCE_CHECKPOINT_FORMAT = "ddsc_gpg_inference_v3"
 LEGACY_INFERENCE_CHECKPOINT_FORMAT = "ddsc_gpg_inference_v2"
 LEGACY_GPG_PARAMETER_COUNT = 8_592_516
 DEFAULT_WORKER_TIMEOUT_SECONDS = 120.0
+INTERSECTION_REGULARIZATION_DELAY_EPOCHS = 2
 LAYER1_DROPOUT_DEFAULTS = {
     "layer1_dropout_mode": "off",
     "layer1_dropout_p": 0.7,
@@ -138,6 +145,11 @@ ARCHITECTURE_ARGUMENT_DEFAULTS = {
     "egs_tsaa_stage2_start_epoch": -1,
     "egs_tsaa_stage2_lam2": 0.0003,
     "egs_tsaa_smooth_loss": "soft",
+}
+INTERSECTION_REGULARIZATION_DEFAULTS = {
+    "intersection_reg_mode": "off",
+    "intersection_reg_lambda": 0.0,
+    "intersection_reg_eps": 1.0e-12,
 }
 
 # These fields change the optimization trajectory or the data presented to the
@@ -156,6 +168,7 @@ RESUME_EXACT_ARGS = (
     "lam_1",
     "lam_2",
     "lam_3",
+    *INTERSECTION_REGULARIZATION_DEFAULTS,
     "pb",
     "seed",
     "device",
@@ -458,8 +471,9 @@ def load_controller_state(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train isolated DDSC-GPG with dynamic lambda-1 and a frozen "
-            "ResNet-50 layer1 encoder"
+            "Train multi-architecture DDSC-GPG with dynamic lambda-1, optional "
+            "previous-support regularization, and a frozen ResNet-50 layer1 "
+            "encoder"
         )
     )
     parser.add_argument(
@@ -560,6 +574,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--lam_2", type=float, default=0.0001)
     parser.add_argument("--lam_3", type=float, default=0.0001)
+    parser.add_argument(
+        "--intersection_reg_mode",
+        "--intersection-reg-mode",
+        dest="intersection_reg_mode",
+        choices=("off", "normalized_l2"),
+        default=INTERSECTION_REGULARIZATION_DEFAULTS["intersection_reg_mode"],
+        help=(
+            "penalize the current deployment-mode soft-mask energy fraction "
+            "on frozen previous-epoch hard support; off preserves the original "
+            "objective"
+        ),
+    )
+    parser.add_argument(
+        "--intersection_reg_lambda",
+        "--intersection-reg-lambda",
+        dest="intersection_reg_lambda",
+        type=float,
+        default=INTERSECTION_REGULARIZATION_DEFAULTS["intersection_reg_lambda"],
+        help="multiplier for normalized previous/current mask intersection",
+    )
+    parser.add_argument(
+        "--intersection_reg_eps",
+        "--intersection-reg-eps",
+        dest="intersection_reg_eps",
+        type=float,
+        default=INTERSECTION_REGULARIZATION_DEFAULTS["intersection_reg_eps"],
+        help="positive denominator stabilizer for normalized intersection",
+    )
     parser.add_argument("--pb", choices=("full", "half"), default="full")
     parser.add_argument("--load_CP", choices=("New", "Continue"), default="New")
     parser.add_argument(
@@ -782,11 +824,34 @@ def validate_args(args: argparse.Namespace) -> None:
         args.lam_1,
         args.lam_2,
         args.lam_3,
+        args.intersection_reg_lambda,
         args.egs_tsaa_stage1_lam2,
         args.egs_tsaa_stage2_lam2,
     )
     if not all(math.isfinite(value) and value >= 0.0 for value in loss_multipliers):
         raise ValueError("loss multipliers must be finite and non-negative")
+    if (
+        not math.isfinite(args.intersection_reg_eps)
+        or args.intersection_reg_eps <= 0.0
+    ):
+        raise ValueError("intersection_reg_eps must be finite and positive")
+    if args.intersection_reg_mode not in {"off", "normalized_l2"}:
+        raise ValueError("intersection_reg_mode must be off or normalized_l2")
+    if (
+        args.intersection_reg_mode == "off"
+        and args.intersection_reg_lambda != 0.0
+    ):
+        raise ValueError(
+            "intersection_reg_lambda must be zero when intersection_reg_mode is off"
+        )
+    if (
+        args.intersection_reg_mode != "off"
+        and args.intersection_reg_lambda <= 0.0
+    ):
+        raise ValueError(
+            "intersection_reg_lambda must be positive when intersection regularization "
+            "is enabled"
+        )
     if not math.isfinite(args.egs_tsaa_tk) or not 0.0 < args.egs_tsaa_tk <= 1.0:
         raise ValueError("egs_tsaa_tk must be finite and in (0, 1]")
     if args.egs_tsaa_stage2_start_epoch < -1:
@@ -859,7 +924,7 @@ def _normalize_checkpoint_train_args(
     *,
     checkpoint_format: str,
 ) -> dict[str, Any]:
-    """Validate v9/v8 args or explicitly migrate simple-mode v7/v6 checkpoints."""
+    """Validate v11/v10 args or explicitly migrate v9/v8/v7/v6 checkpoints."""
 
     if not isinstance(stored_args, Mapping):
         raise ValueError("checkpoint train_args must be a mapping")
@@ -867,6 +932,26 @@ def _normalize_checkpoint_train_args(
     # Checkpoints written before decoder topology became configurable used the
     # shared decoder exclusively.  Preserve exact continuation for those runs.
     normalized.setdefault("decoder_mode", "shared")
+    intersection_keys = set(INTERSECTION_REGULARIZATION_DEFAULTS)
+    intersection_present = intersection_keys.intersection(normalized)
+    if checkpoint_format in {
+        CHECKPOINT_FORMAT,
+        PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
+    }:
+        if intersection_present != intersection_keys:
+            missing = sorted(intersection_keys - intersection_present)
+            raise ValueError(
+                f"{checkpoint_format} intersection-regularization arguments "
+                "are incomplete: "
+                f"missing={missing}"
+            )
+    else:
+        if intersection_present:
+            raise ValueError(
+                f"{checkpoint_format} must not contain v10+ intersection "
+                f"arguments: present={sorted(intersection_present)}"
+            )
+        normalized.update(INTERSECTION_REGULARIZATION_DEFAULTS)
     dropout_keys = set(LAYER1_DROPOUT_DEFAULTS)
     architecture_keys = set(ARCHITECTURE_ARGUMENT_DEFAULTS)
     present = dropout_keys.intersection(normalized)
@@ -874,6 +959,8 @@ def _normalize_checkpoint_train_args(
     if checkpoint_format in {
         CHECKPOINT_FORMAT,
         PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
+        PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT,
+        ARCHITECTURE_TRAINING_CHECKPOINT_FORMAT,
     }:
         if present != dropout_keys:
             missing = sorted(dropout_keys - present)
@@ -1322,6 +1409,101 @@ def hard_spatial_support(continuous_mask: torch.Tensor) -> torch.Tensor:
     if continuous_mask.ndim != 4 or continuous_mask.shape[1] != 1:
         raise ValueError("continuous_mask must have shape Bx1xHxW")
     return (continuous_mask.detach() >= 0.5).flatten(1).sum(dim=1)
+
+
+def temporal_overlap_mask(
+    architecture_mode: str,
+    continuous_mask: torch.Tensor,
+    *,
+    structured_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the soft mask whose deployed support is compared across epochs."""
+
+    mode = canonical_architecture_mode(architecture_mode)
+    if continuous_mask.ndim != 4 or continuous_mask.shape[1] != 1:
+        raise ValueError("continuous_mask must have shape Bx1xHxW")
+    if mode != "egs_tsaa":
+        return continuous_mask
+    if structured_mask is None:
+        raise ValueError("egs_tsaa temporal overlap requires a structured mask")
+    if structured_mask.shape != continuous_mask.shape:
+        raise ValueError("structured mask shape differs from continuous mask")
+    if structured_mask.device != continuous_mask.device:
+        raise ValueError("structured mask device differs from continuous mask")
+    return continuous_mask * structured_mask.detach().to(continuous_mask.dtype)
+
+
+def intersection_regularization_active(epoch: int, warmup_epochs: int) -> bool:
+    """Return whether the post-warmup temporal penalty is active this epoch."""
+
+    if type(epoch) is not int or epoch < 0:
+        raise ValueError("epoch must be a non-negative plain integer")
+    if type(warmup_epochs) is not int or warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be a non-negative plain integer")
+    activation_epoch = warmup_epochs + INTERSECTION_REGULARIZATION_DELAY_EPOCHS
+    return epoch >= activation_epoch
+
+
+def normalized_temporal_intersection_loss(
+    current_mask: torch.Tensor,
+    previous_mask: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    """Return summed current energy fractions on previous hard support."""
+
+    if current_mask.ndim != 4 or current_mask.shape[1] != 1:
+        raise ValueError("current_mask must have shape Bx1xHxW")
+    if previous_mask.shape != current_mask.shape:
+        raise ValueError("previous mask shape differs from current mask")
+    if previous_mask.device != current_mask.device:
+        raise ValueError("previous mask device differs from current mask")
+    if not current_mask.is_floating_point() or not previous_mask.is_floating_point():
+        raise ValueError("temporal intersection masks must be floating point")
+    if not math.isfinite(float(eps)) or eps <= 0.0:
+        raise ValueError("temporal intersection eps must be finite and positive")
+    current_flat = current_mask.float().flatten(1)
+    previous_support = (
+        previous_mask.detach().float().flatten(1) >= 0.5
+    ).to(dtype=torch.float32)
+    current_energy = current_flat.square()
+    numerator = torch.sum(previous_support * current_energy, dim=1)
+    denominator = torch.sum(current_energy, dim=1) + float(eps)
+    return torch.sum(numerator / denominator)
+
+
+@contextmanager
+def generator_deployment_mask_mode(
+    generator: torch.nn.Module,
+) -> Iterator[None]:
+    """Temporarily select deterministic deployment behavior without no-grad."""
+
+    training_flags = tuple(
+        (module, bool(module.training)) for module in generator.modules()
+    )
+    has_evaluate = hasattr(generator, "evaluate")
+    previous_evaluate = getattr(generator, "evaluate", None)
+    generator.eval()
+    if has_evaluate:
+        setattr(generator, "evaluate", True)
+    try:
+        yield
+    finally:
+        if has_evaluate:
+            setattr(generator, "evaluate", previous_evaluate)
+        for module, training in training_flags:
+            module.training = training
+
+
+def frozen_generator_snapshot(generator: torch.nn.Module) -> torch.nn.Module:
+    """Clone a generator as a deterministic, gradient-free epoch teacher."""
+
+    snapshot = copy.deepcopy(generator)
+    snapshot.requires_grad_(False)
+    snapshot.eval()
+    if hasattr(snapshot, "evaluate"):
+        setattr(snapshot, "evaluate", True)
+    return snapshot
 
 
 def cw_loss(
@@ -1981,6 +2163,8 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         expected_formats=(
             CHECKPOINT_FORMAT,
             PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
+            PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT,
+            ARCHITECTURE_TRAINING_CHECKPOINT_FORMAT,
             LAYER1_DROPOUT_TRAINING_CHECKPOINT_FORMAT,
             LEGACY_TRAINING_CHECKPOINT_FORMAT,
         ),
@@ -2004,7 +2188,11 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         "runtime_contract",
     }
     required = set(legacy_required)
-    if checkpoint_format == CHECKPOINT_FORMAT:
+    if checkpoint_format in {
+        CHECKPOINT_FORMAT,
+        PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
+        PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT,
+    }:
         required.add("conditioner_contract")
     if set(payload) != required:
         raise ValueError(
@@ -2069,13 +2257,25 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         expected_model_type=payload["train_args"]["model_type"],
     )
     architecture_mode = payload["train_args"]["architecture_mode"]
-    if checkpoint_format != CHECKPOINT_FORMAT:
+    if checkpoint_format not in {
+        CHECKPOINT_FORMAT,
+        PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
+        PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT,
+    }:
         if architecture_mode == "egs_tsaa":
             raise ValueError(
                 "legacy EGS-TSSA training checkpoint lacks the required "
                 "classifier/conditioner contract"
             )
         payload["conditioner_contract"] = None
+    if (
+        checkpoint_format == PREVIOUS_TRAINING_CHECKPOINT_FORMAT
+        and payload["train_args"]["intersection_reg_mode"] != "off"
+    ):
+        raise ValueError(
+            "v10 checkpoint used the pre-delay intersection schedule and cannot "
+            "be resumed exactly by v11; restart training or resume with the v10 code"
+        )
     conditioner_contract = payload["conditioner_contract"]
     if architecture_mode == "egs_tsaa":
         if not _values_equal_exact(
@@ -3060,6 +3260,13 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             f"checkpoint next_epoch={start_epoch} leaves no work for epochs={args.epochs}"
         )
 
+    previous_net_g: torch.nn.Module | None = None
+    if args.intersection_reg_mode != "off" and start_epoch > 0:
+        previous_net_g = frozen_generator_snapshot(net_g)
+    intersection_activation_epoch = (
+        args.ddsc_warmup_epochs + INTERSECTION_REGULARIZATION_DELAY_EPOCHS
+    )
+
     trainable_parameters = parameter_count(net_g, trainable_only=True)
     total_generator_parameters = parameter_count(net_g)
     reduction = 1.0 - trainable_parameters / LEGACY_GPG_PARAMETER_COUNT
@@ -3154,6 +3361,26 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         }[args.architecture_mode],
     )
     LOGGER.info(
+        "intersection_regularization mode=%s lambda=%.9g eps=%.9g "
+        "comparison=current_and_frozen_previous_deployment_mode "
+        "previous_support=hard reduction=batch_sum activation_epoch=%d "
+        "warmup_epochs=%d post_warmup_delay_epochs=%d",
+        args.intersection_reg_mode,
+        args.intersection_reg_lambda,
+        args.intersection_reg_eps,
+        intersection_activation_epoch,
+        args.ddsc_warmup_epochs,
+        INTERSECTION_REGULARIZATION_DELAY_EPOCHS,
+    )
+    if (
+        args.intersection_reg_mode != "off"
+        and max(start_epoch, intersection_activation_epoch) >= args.epochs
+    ):
+        LOGGER.warning(
+            "epoch budget ends before delayed intersection regularization can run; "
+            "raw previous/current intersection is still logged when available"
+        )
+    LOGGER.info(
         "attack_objective layer1_dropout_mode=%s p=%.6g channel_ratio=%.6g "
         "hf_ratio=%.6g stochastic_members=%d clean_members=1 "
         "eot_reduction=%s isolated_from_clean_labels_and_generator=True",
@@ -3185,11 +3412,27 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             args.ddsc_warmup_epochs,
             controller_state,
         )
+        intersection_active = (
+            args.intersection_reg_mode != "off"
+            and intersection_regularization_active(
+                epoch,
+                args.ddsc_warmup_epochs,
+            )
+        )
+        if intersection_active and previous_net_g is None:
+            raise RuntimeError(
+                "intersection regularization is active without a previous-epoch model"
+            )
+        intersection_lambda_applied = (
+            args.intersection_reg_lambda if intersection_active else 0.0
+        )
         fool_count_epoch = 0
         support_sum = 0.0
         support_samples = 0
         window_fool_count = 0
         window_samples = 0
+        intersection_sum = 0.0
+        intersection_samples = 0
         last_metrics: dict[str, float] = {}
 
         # Match the historical one-base-seed-per-epoch sampler transition while
@@ -3249,6 +3492,49 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 pgd_delta=grad_delta,
                 structured_mask=structured_mask,
             )
+            intersection_loss = adv_00.new_zeros(())
+            if previous_net_g is not None:
+                fork_devices = (
+                    [device.index]
+                    if device.type == "cuda" and device.index is not None
+                    else []
+                )
+                with torch.random.fork_rng(devices=fork_devices):
+                    with torch.set_grad_enabled(intersection_active):
+                        with generator_deployment_mask_mode(net_g):
+                            current_temporal_mask = forward_generator_training(
+                                net_g,
+                                args.architecture_mode,
+                                image,
+                                args.eps / 255.0,
+                                pgd_delta=grad_delta,
+                                structured_mask=structured_mask,
+                            )[3]
+                with torch.random.fork_rng(devices=fork_devices):
+                    with torch.no_grad():
+                        previous_adv_00 = forward_generator_training(
+                            previous_net_g,
+                            args.architecture_mode,
+                            image,
+                            args.eps / 255.0,
+                            pgd_delta=grad_delta,
+                            structured_mask=structured_mask,
+                        )[3]
+                current_overlap_mask = temporal_overlap_mask(
+                    args.architecture_mode,
+                    current_temporal_mask,
+                    structured_mask=structured_mask,
+                )
+                previous_overlap_mask = temporal_overlap_mask(
+                    args.architecture_mode,
+                    previous_adv_00,
+                    structured_mask=structured_mask,
+                )
+                intersection_loss = normalized_temporal_intersection_loss(
+                    current_overlap_mask,
+                    previous_overlap_mask,
+                    eps=args.intersection_reg_eps,
+                )
             objective_cw = cw_loss if args.architecture_mode == "simple" else legacy_cw_loss
             loss_adv, adv_logits = attack_model_loss_and_logits(
                 attack_objective_model,
@@ -3307,6 +3593,10 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 pgd_delta=grad_delta,
                 feature_guidance=generator_aux.get("feature_guidance"),
             )
+            intersection_weighted = (
+                intersection_lambda_applied * intersection_loss
+            )
+            loss = loss + intersection_weighted
             loss.backward()
             optimizer.step()
 
@@ -3317,6 +3607,9 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             fool_count_epoch += batch_fool_count
             window_fool_count += batch_fool_count
             window_samples += batch_size_actual
+            if previous_net_g is not None:
+                intersection_sum += float(intersection_loss.detach())
+                intersection_samples += batch_size_actual
 
             should_measure = (
                 batch_index % report_interval == 0 or batch_index % 2000 == 0
@@ -3329,6 +3622,9 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     "spa_weighted": float((lambda1_applied * loss_spa).detach()),
                     "qua_weighted": float((lambda2_applied * loss_qua).detach()),
                     "guidance_weighted": float(guidance_loss.detach()),
+                    "intersection": float(intersection_loss.detach()),
+                    "intersection_weighted": float(intersection_weighted.detach()),
+                    "intersection_active": float(intersection_active),
                     "l0": float(batch_support.to(dtype=torch.float64).mean().item()),
                     "l1": float(
                         (torch.norm(perturbation, p=1) / batch_size_actual).item()
@@ -3346,7 +3642,8 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 LOGGER.info(
                     "epoch=%d progress=%d/%d lambda1=%.9g l0=%.2f l1=%.2f "
                     "l2=%.2f linf=%.6f loss=%.3f adv=%.3f spa=%.3f "
-                    "qua=%.3f guidance=%.3f FR=%.4f",
+                    "qua=%.3f guidance=%.3f intersection=%.6f "
+                    "intersection_weighted=%.6f intersection_active=%s FR=%.4f",
                     epoch,
                     batch_index,
                     len(train_loader),
@@ -3360,6 +3657,9 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     last_metrics["spa_weighted"],
                     last_metrics["qua_weighted"],
                     last_metrics["guidance_weighted"],
+                    last_metrics["intersection"],
+                    last_metrics["intersection_weighted"],
+                    intersection_active,
                     last_metrics["fool_rate_window"],
                 )
 
@@ -3381,19 +3681,31 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             raise RuntimeError("training loader produced no samples")
         observed_k = support_sum / support_samples
         fool_rate_epoch = fool_count_epoch / support_samples
+        mean_intersection = (
+            intersection_sum / intersection_samples
+            if intersection_samples > 0
+            else 0.0
+        )
         print(
             f"running:{epoch} | FR-{args.model_type}:{fool_rate_epoch:.6f} | "
             f"lambda1:{lambda1_applied:.9g} | support:{observed_k:.3f}/"
-            f"{target_k}"
+            f"{target_k} | intersection:{mean_intersection:.6f} | "
+            f"intersection_active:{intersection_active}"
         )
         LOGGER.info(
             "epoch_summary epoch=%d FR=%.9g lambda1_applied=%.9g "
-            "observed_k=%.9g target_k=%d",
+            "observed_k=%.9g target_k=%d intersection=%.9g "
+            "intersection_weighted=%.9g intersection_active=%s "
+            "intersection_lambda_applied=%.9g",
             epoch,
             fool_rate_epoch,
             lambda1_applied,
             observed_k,
             target_k,
+            mean_intersection,
+            intersection_lambda_applied * mean_intersection,
+            intersection_active,
+            intersection_lambda_applied,
         )
 
         controller_state, diagnostics = update_controller_after_epoch(
@@ -3412,6 +3724,19 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 epoch + 1,
                 args.ddsc_warmup_epochs,
             )
+
+        if (
+            args.intersection_reg_mode != "off"
+            and epoch < args.epochs - 1
+        ):
+            if previous_net_g is None:
+                previous_net_g = frozen_generator_snapshot(net_g)
+            else:
+                previous_net_g.load_state_dict(net_g.state_dict(), strict=True)
+                previous_net_g.requires_grad_(False)
+                previous_net_g.eval()
+                if hasattr(previous_net_g, "evaluate"):
+                    setattr(previous_net_g, "evaluate", True)
 
         if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
             inference_path, training_path = save_epoch_checkpoints(
@@ -3471,13 +3796,17 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "ARCHITECTURE_TRAINING_CHECKPOINT_FORMAT",
     "CHECKPOINT_FORMAT",
     "DEFAULT_WORKER_TIMEOUT_SECONDS",
     "INFERENCE_CHECKPOINT_FORMAT",
+    "INTERSECTION_REGULARIZATION_DELAY_EPOCHS",
+    "INTERSECTION_REGULARIZATION_DEFAULTS",
     "LAYER1_DROPOUT_TRAINING_CHECKPOINT_FORMAT",
     "LAYER1_DROPOUT_DEFAULTS",
     "LEGACY_INFERENCE_CHECKPOINT_FORMAT",
     "LEGACY_TRAINING_CHECKPOINT_FORMAT",
+    "PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT",
     "PREVIOUS_TRAINING_CHECKPOINT_FORMAT",
     "DDSCControllerConfig",
     "DDSCControllerState",
@@ -3502,10 +3831,13 @@ __all__ = [
     "expected_adam_group_options",
     "expected_optimizer_step",
     "file_fingerprint",
+    "generator_deployment_mask_mode",
     "hard_spatial_support",
+    "frozen_generator_snapshot",
     "forward_generator_inference",
     "forward_generator_training",
     "initial_controller_state",
+    "intersection_regularization_active",
     "lambda1_for_epoch",
     "legacy_cw_loss",
     "load_controller_state",
@@ -3513,6 +3845,7 @@ __all__ = [
     "load_training_checkpoint",
     "main",
     "normalize_for_classifier",
+    "normalized_temporal_intersection_loss",
     "optimizer_spec_for_generator",
     "restore_rng_state",
     "resolve_training_device",
@@ -3520,6 +3853,7 @@ __all__ = [
     "run_training",
     "save_epoch_checkpoints",
     "seed_everything",
+    "temporal_overlap_mask",
     "update_controller_after_epoch",
     "validate_controller_config",
     "validate_controller_state",
