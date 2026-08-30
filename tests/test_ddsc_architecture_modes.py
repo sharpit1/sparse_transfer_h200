@@ -15,6 +15,9 @@ if str(GPG_DIR) not in sys.path:
     sys.path.insert(0, str(GPG_DIR))
 
 import DDSC_GPG_train as ddsc_train  # noqa: E402
+from DDSC_GPG_train_training_reuse import (  # noqa: E402
+    build_training_reuse_source,
+)
 from ddsc_architecture_modes import (  # noqa: E402
     EGSStructuredMask,
     build_original_generator,
@@ -58,6 +61,19 @@ class _TinyEGSResNet(nn.Module):
 
 
 class ArchitectureModeContractTests(unittest.TestCase):
+    def test_training_reuse_wrapper_reuses_adv00_and_keeps_previous_forward(
+        self,
+    ) -> None:
+        source = build_training_reuse_source()
+        compile(source, "DDSC_GPG_train.py", "exec")
+        self.assertEqual(source.count("current_temporal_mask = adv_00"), 1)
+        self.assertNotIn("with generator_deployment_mask_mode(net_g):", source)
+        self.assertEqual(
+            source.count("previous_adv_00 = forward_generator_training("),
+            1,
+        )
+        self.assertIn("_CM-training-adv00", source)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.previous_threads = torch.get_num_threads()
@@ -99,6 +115,17 @@ class ArchitectureModeContractTests(unittest.TestCase):
             ddsc_train.validate_args(args)
             self.assertEqual(args.intersection_reg_mode, "normalized_l2")
             self.assertEqual(args.intersection_reg_lambda, 0.25)
+
+        fixed = parser.parse_args(
+            [
+                "--intersection_reg_mode",
+                "fixed",
+                "--intersection_reg_lambda",
+                "0.25",
+            ]
+        )
+        ddsc_train.validate_args(fixed)
+        self.assertEqual(fixed.intersection_reg_mode, "fixed")
 
         invalid_enabled = parser.parse_args(
             ["--intersection_reg_mode", "normalized_l2"]
@@ -220,6 +247,36 @@ class ArchitectureModeContractTests(unittest.TestCase):
         self.assertEqual(half_loss.dtype, torch.float32)
         half_loss.backward()
         self.assertTrue(torch.isfinite(half_current.grad).all())
+
+    def test_fixed_temporal_intersection_uses_previous_support_denominator(
+        self,
+    ) -> None:
+        current = torch.tensor(
+            [
+                [[[0.8, 0.4, 0.6]]],
+                [[[0.7, 0.5, 0.3]]],
+            ],
+            requires_grad=True,
+        )
+        previous = torch.tensor(
+            [
+                [[[0.9, 0.8, 0.0]]],
+                [[[0.0, 0.0, 0.0]]],
+            ],
+            requires_grad=True,
+        )
+        loss = ddsc_train.fixed_temporal_intersection_loss(
+            current,
+            previous,
+            eps=1.0e-12,
+        )
+        self.assertAlmostEqual(float(loss), (0.64 + 0.16) / 2.0, places=6)
+        loss.backward()
+        self.assertGreater(float(current.grad[0, 0, 0, 0]), 0.0)
+        self.assertGreater(float(current.grad[0, 0, 0, 1]), 0.0)
+        self.assertEqual(float(current.grad[0, 0, 0, 2]), 0.0)
+        self.assertTrue(torch.equal(current.grad[1], torch.zeros_like(current.grad[1])))
+        self.assertIsNone(previous.grad)
 
     def test_temporal_overlap_uses_deployed_egs_support(self) -> None:
         continuous = torch.tensor(

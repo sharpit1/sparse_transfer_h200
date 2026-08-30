@@ -578,12 +578,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--intersection_reg_mode",
         "--intersection-reg-mode",
         dest="intersection_reg_mode",
-        choices=("off", "normalized_l2"),
+        choices=("off", "normalized_l2", "fixed"),
         default=INTERSECTION_REGULARIZATION_DEFAULTS["intersection_reg_mode"],
         help=(
-            "penalize the current deployment-mode soft-mask energy fraction "
-            "on frozen previous-epoch hard support; off preserves the original "
-            "objective"
+            "penalize the current deployment-mode soft-mask energy on frozen "
+            "previous-epoch hard support; normalized_l2 divides by current-mask "
+            "energy, fixed divides by previous-support size, and off preserves "
+            "the original objective"
         ),
     )
     parser.add_argument(
@@ -835,8 +836,10 @@ def validate_args(args: argparse.Namespace) -> None:
         or args.intersection_reg_eps <= 0.0
     ):
         raise ValueError("intersection_reg_eps must be finite and positive")
-    if args.intersection_reg_mode not in {"off", "normalized_l2"}:
-        raise ValueError("intersection_reg_mode must be off or normalized_l2")
+    if args.intersection_reg_mode not in {"off", "normalized_l2", "fixed"}:
+        raise ValueError(
+            "intersection_reg_mode must be off, normalized_l2, or fixed"
+        )
     if (
         args.intersection_reg_mode == "off"
         and args.intersection_reg_lambda != 0.0
@@ -1470,6 +1473,36 @@ def normalized_temporal_intersection_loss(
     numerator = torch.sum(previous_support * current_energy, dim=1)
     denominator = torch.sum(current_energy, dim=1) + float(eps)
     return torch.sum(numerator / denominator)
+
+
+def fixed_temporal_intersection_loss(
+    current_mask: torch.Tensor,
+    previous_mask: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    """Return current energy on previous support, normalized by support size."""
+
+    if current_mask.ndim != 4 or current_mask.shape[1] != 1:
+        raise ValueError("current_mask must have shape Bx1xHxW")
+    if previous_mask.shape != current_mask.shape:
+        raise ValueError("previous mask shape differs from current mask")
+    if previous_mask.device != current_mask.device:
+        raise ValueError("previous mask device differs from current mask")
+    if not current_mask.is_floating_point() or not previous_mask.is_floating_point():
+        raise ValueError("temporal intersection masks must be floating point")
+    if not math.isfinite(float(eps)) or eps <= 0.0:
+        raise ValueError("temporal intersection eps must be finite and positive")
+    current_flat = current_mask.float().flatten(1)
+    previous_support = (
+        previous_mask.detach().float().flatten(1) >= 0.5
+    ).to(dtype=torch.float32)
+    numerator = torch.sum(previous_support * current_flat.square(), dim=1)
+    support_size = torch.sum(previous_support, dim=1)
+    valid = support_size > 0.0
+    if not torch.any(valid):
+        return current_flat.sum() * 0.0
+    return torch.sum(numerator[valid] / (support_size[valid] + float(eps)))
 
 
 @contextmanager
@@ -3530,11 +3563,18 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     previous_adv_00,
                     structured_mask=structured_mask,
                 )
-                intersection_loss = normalized_temporal_intersection_loss(
-                    current_overlap_mask,
-                    previous_overlap_mask,
-                    eps=args.intersection_reg_eps,
-                )
+                if args.intersection_reg_mode == "fixed":
+                    intersection_loss = fixed_temporal_intersection_loss(
+                        current_overlap_mask,
+                        previous_overlap_mask,
+                        eps=args.intersection_reg_eps,
+                    )
+                else:
+                    intersection_loss = normalized_temporal_intersection_loss(
+                        current_overlap_mask,
+                        previous_overlap_mask,
+                        eps=args.intersection_reg_eps,
+                    )
             objective_cw = cw_loss if args.architecture_mode == "simple" else legacy_cw_loss
             loss_adv, adv_logits = attack_model_loss_and_logits(
                 attack_objective_model,
@@ -3836,6 +3876,7 @@ __all__ = [
     "frozen_generator_snapshot",
     "forward_generator_inference",
     "forward_generator_training",
+    "fixed_temporal_intersection_loss",
     "initial_controller_state",
     "intersection_regularization_active",
     "lambda1_for_epoch",
