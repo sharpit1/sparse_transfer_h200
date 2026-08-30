@@ -1505,6 +1505,58 @@ def fixed_temporal_intersection_loss(
     return torch.sum(numerator[valid] / (support_size[valid] + float(eps)))
 
 
+def hard_temporal_intersection_metrics(
+    current_mask: torch.Tensor,
+    previous_mask: torch.Tensor,
+    *,
+    threshold: float = 0.5,
+) -> dict[str, torch.Tensor]:
+    """Return detached per-image hard-overlap diagnostics."""
+
+    if current_mask.ndim != 4 or current_mask.shape[1] != 1:
+        raise ValueError("current_mask must have shape Bx1xHxW")
+    if previous_mask.shape != current_mask.shape:
+        raise ValueError("previous mask shape differs from current mask")
+    if previous_mask.device != current_mask.device:
+        raise ValueError("previous mask device differs from current mask")
+    if not current_mask.is_floating_point() or not previous_mask.is_floating_point():
+        raise ValueError("temporal intersection masks must be floating point")
+    if not math.isfinite(float(threshold)):
+        raise ValueError("hard-overlap threshold must be finite")
+
+    current_support = current_mask.detach().float().flatten(1) >= float(threshold)
+    previous_support = previous_mask.detach().float().flatten(1) >= float(threshold)
+    intersection_support = current_support & previous_support
+    union_support = current_support | previous_support
+
+    current_count = current_support.sum(dim=1).to(dtype=torch.float64)
+    previous_count = previous_support.sum(dim=1).to(dtype=torch.float64)
+    intersection_count = intersection_support.sum(dim=1).to(dtype=torch.float64)
+    union_count = union_support.sum(dim=1).to(dtype=torch.float64)
+    zeros = torch.zeros_like(intersection_count)
+    spatial_pixels = float(current_support.shape[1])
+
+    return {
+        "intersection_count": intersection_count,
+        "density": intersection_count / spatial_pixels,
+        "rprev_percent": torch.where(
+            previous_count > 0.0,
+            100.0 * intersection_count / previous_count,
+            zeros,
+        ),
+        "rcurr_percent": torch.where(
+            current_count > 0.0,
+            100.0 * intersection_count / current_count,
+            zeros,
+        ),
+        "jaccard_percent": torch.where(
+            union_count > 0.0,
+            100.0 * intersection_count / union_count,
+            zeros,
+        ),
+    }
+
+
 @contextmanager
 def generator_deployment_mask_mode(
     generator: torch.nn.Module,
@@ -3466,6 +3518,12 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         window_samples = 0
         intersection_sum = 0.0
         intersection_samples = 0
+        hard_intersection_pixel_sum = 0.0
+        hard_overlap_pixel_denominator = 0
+        hard_rprev_percent_sum = 0.0
+        hard_rcurr_percent_sum = 0.0
+        hard_jaccard_percent_sum = 0.0
+        hard_overlap_samples = 0
         last_metrics: dict[str, float] = {}
 
         # Match the historical one-base-seed-per-epoch sampler transition while
@@ -3526,6 +3584,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 structured_mask=structured_mask,
             )
             intersection_loss = adv_00.new_zeros(())
+            hard_overlap_metrics: dict[str, torch.Tensor] | None = None
             if previous_net_g is not None:
                 fork_devices = (
                     [device.index]
@@ -3562,6 +3621,11 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     args.architecture_mode,
                     previous_adv_00,
                     structured_mask=structured_mask,
+                )
+                hard_overlap_metrics = hard_temporal_intersection_metrics(
+                    current_overlap_mask,
+                    previous_overlap_mask,
+                    threshold=0.5,
                 )
                 if args.intersection_reg_mode == "fixed":
                     intersection_loss = fixed_temporal_intersection_loss(
@@ -3650,6 +3714,22 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             if previous_net_g is not None:
                 intersection_sum += float(intersection_loss.detach())
                 intersection_samples += batch_size_actual
+                if hard_overlap_metrics is None:
+                    raise RuntimeError("hard-overlap metrics were not computed")
+                hard_metric_sums = torch.stack(
+                    (
+                        hard_overlap_metrics["intersection_count"].sum(),
+                        hard_overlap_metrics["rprev_percent"].sum(),
+                        hard_overlap_metrics["rcurr_percent"].sum(),
+                        hard_overlap_metrics["jaccard_percent"].sum(),
+                    )
+                ).cpu().tolist()
+                hard_intersection_pixel_sum += float(hard_metric_sums[0])
+                hard_rprev_percent_sum += float(hard_metric_sums[1])
+                hard_rcurr_percent_sum += float(hard_metric_sums[2])
+                hard_jaccard_percent_sum += float(hard_metric_sums[3])
+                hard_overlap_pixel_denominator += current_overlap_mask.numel()
+                hard_overlap_samples += batch_size_actual
 
             should_measure = (
                 batch_index % report_interval == 0 or batch_index % 2000 == 0
@@ -3702,6 +3782,18 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     intersection_active,
                     last_metrics["fool_rate_window"],
                 )
+                if hard_overlap_metrics is not None:
+                    LOGGER.info(
+                        "HARD_OVERLAP_BATCH epoch=%d batch=%d "
+                        "hard_intersection_density=%.9g Rprev=%.9g "
+                        "Rcurr=%.9g Jaccard=%.9g threshold=0.5",
+                        epoch,
+                        batch_index,
+                        float(hard_overlap_metrics["density"].mean()),
+                        float(hard_overlap_metrics["rprev_percent"].mean()),
+                        float(hard_overlap_metrics["rcurr_percent"].mean()),
+                        float(hard_overlap_metrics["jaccard_percent"].mean()),
+                    )
 
             if batch_index in (100, 10000, 20000, 30000):
                 vutils.save_image(
@@ -3746,6 +3838,32 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             intersection_lambda_applied * mean_intersection,
             intersection_active,
             intersection_lambda_applied,
+        )
+        LOGGER.info(
+            "HARD_OVERLAP_EPOCH epoch=%d hard_intersection_density=%.9g "
+            "Rprev=%.9g Rcurr=%.9g Jaccard=%.9g threshold=0.5 "
+            "empty_denominator=record_as_zero",
+            epoch,
+            (
+                hard_intersection_pixel_sum / hard_overlap_pixel_denominator
+                if hard_overlap_pixel_denominator > 0
+                else 0.0
+            ),
+            (
+                hard_rprev_percent_sum / hard_overlap_samples
+                if hard_overlap_samples > 0
+                else 0.0
+            ),
+            (
+                hard_rcurr_percent_sum / hard_overlap_samples
+                if hard_overlap_samples > 0
+                else 0.0
+            ),
+            (
+                hard_jaccard_percent_sum / hard_overlap_samples
+                if hard_overlap_samples > 0
+                else 0.0
+            ),
         )
 
         controller_state, diagnostics = update_controller_after_epoch(
@@ -3877,6 +3995,7 @@ __all__ = [
     "forward_generator_inference",
     "forward_generator_training",
     "fixed_temporal_intersection_loss",
+    "hard_temporal_intersection_metrics",
     "initial_controller_state",
     "intersection_regularization_active",
     "lambda1_for_epoch",

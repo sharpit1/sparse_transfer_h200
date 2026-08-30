@@ -1,4 +1,5 @@
 import copy
+import inspect
 import pathlib
 import sys
 import tempfile
@@ -277,6 +278,42 @@ class ArchitectureModeContractTests(unittest.TestCase):
         self.assertEqual(float(current.grad[0, 0, 0, 2]), 0.0)
         self.assertTrue(torch.equal(current.grad[1], torch.zeros_like(current.grad[1])))
         self.assertIsNone(previous.grad)
+
+    def test_hard_temporal_intersection_metrics_and_logging_contract(self) -> None:
+        current = torch.tensor(
+            [
+                [[[0.6, 0.49], [0.5, 0.1]]],
+                [[[0.0, 0.0], [0.0, 0.0]]],
+            ],
+            requires_grad=True,
+        )
+        previous = torch.tensor(
+            [
+                [[[0.7, 0.8], [0.4, 0.1]]],
+                [[[0.0, 0.0], [0.0, 0.0]]],
+            ]
+        )
+        metrics = ddsc_train.hard_temporal_intersection_metrics(
+            current,
+            previous,
+            threshold=0.5,
+        )
+        self.assertEqual(metrics["intersection_count"].tolist(), [1.0, 0.0])
+        self.assertEqual(metrics["density"].tolist(), [0.25, 0.0])
+        self.assertEqual(metrics["rprev_percent"].tolist(), [50.0, 0.0])
+        self.assertEqual(metrics["rcurr_percent"].tolist(), [50.0, 0.0])
+        self.assertAlmostEqual(
+            metrics["jaccard_percent"][0].item(),
+            100.0 / 3.0,
+        )
+        self.assertEqual(metrics["jaccard_percent"][1].item(), 0.0)
+        self.assertTrue(
+            all(not value.requires_grad for value in metrics.values())
+        )
+        training_source = inspect.getsource(ddsc_train._run_training_impl)
+        self.assertIn("HARD_OVERLAP_BATCH", training_source)
+        self.assertIn("HARD_OVERLAP_EPOCH", training_source)
+        self.assertIn("empty_denominator=record_as_zero", training_source)
 
     def test_temporal_overlap_uses_deployed_egs_support(self) -> None:
         continuous = torch.tensor(
