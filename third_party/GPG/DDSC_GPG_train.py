@@ -34,7 +34,7 @@ import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -575,6 +575,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lam_2", type=float, default=0.0001)
     parser.add_argument("--lam_3", type=float, default=0.0001)
     parser.add_argument(
+        "--resume_lam_1_override",
+        "--resume-lam-1-override",
+        dest="resume_lam_1_override",
+        type=float,
+        default=None,
+        help="override controller lambda-1 after an exact training-checkpoint restore",
+    )
+    parser.add_argument(
         "--intersection_reg_mode",
         "--intersection-reg-mode",
         dest="intersection_reg_mode",
@@ -831,6 +839,14 @@ def validate_args(args: argparse.Namespace) -> None:
     )
     if not all(math.isfinite(value) and value >= 0.0 for value in loss_multipliers):
         raise ValueError("loss multipliers must be finite and non-negative")
+    if args.resume_lam_1_override is not None:
+        if args.load_CP != "Continue":
+            raise ValueError("resume_lam_1_override requires --load_CP Continue")
+        if (
+            not math.isfinite(args.resume_lam_1_override)
+            or args.resume_lam_1_override < 0.0
+        ):
+            raise ValueError("resume_lam_1_override must be finite and non-negative")
     if (
         not math.isfinite(args.intersection_reg_eps)
         or args.intersection_reg_eps <= 0.0
@@ -3332,6 +3348,20 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             resume_payload["controller_state"],
             controller_config,
         )
+        if args.resume_lam_1_override is not None:
+            controller_state = validate_controller_state(
+                replace(
+                    controller_state,
+                    lambda1=float(args.resume_lam_1_override),
+                    velocity=0.0,
+                ),
+                controller_config,
+            )
+            LOGGER.info(
+                "resume lambda1 override old=%.9g new=%.9g velocity_reset=True",
+                resume_payload["controller_state"]["lambda1"],
+                controller_state.lambda1,
+            )
         start_epoch = _require_plain_int(
             resume_payload["next_epoch"], "next_epoch"
         )
