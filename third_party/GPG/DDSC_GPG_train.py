@@ -138,6 +138,9 @@ LAYER1_DROPOUT_DEFAULTS = {
     "layer1_dropout_eot_samples": 1,
     "layer1_dropout_eot_reduction": "logits",
 }
+PGD_GUIDANCE_DEFAULTS = {
+    "pgd_guidance_teacher": "shared",
+}
 ARCHITECTURE_ARGUMENT_DEFAULTS = {
     "architecture_mode": "simple",
     "egs_tsaa_tk": 0.6,
@@ -178,6 +181,7 @@ RESUME_EXACT_ARGS = (
     "decoder_upsample_backend",
     "decoder_mode",
     *LAYER1_DROPOUT_DEFAULTS,
+    *PGD_GUIDANCE_DEFAULTS,
     "ddsc_target_density",
     "ddsc_warmup_epochs",
     "ddsc_ema_decay",
@@ -552,6 +556,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=LAYER1_DROPOUT_DEFAULTS["layer1_dropout_eot_reduction"],
         help="average member logits or member losses for attack objectives",
     )
+    parser.add_argument(
+        "--pgd_guidance_teacher",
+        "--pgd-guidance-teacher",
+        dest="pgd_guidance_teacher",
+        choices=("shared", "mean"),
+        default=PGD_GUIDANCE_DEFAULTS["pgd_guidance_teacher"],
+        help=(
+            "shared optimizes one PGD delta over the EOT objective; mean "
+            "averages independently optimized clean and dropout-member deltas"
+        ),
+    )
     parser.add_argument("--eps", type=int, default=10, help="perturbation budget")
     parser.add_argument("--target", type=int, default=-1, help="-1 if untargeted")
     parser.add_argument("--batch_size", type=int, default=16)
@@ -823,6 +838,15 @@ def validate_args(args: argparse.Namespace) -> None:
                 "gpg/tsaa/egs_tsaa require layer1_dropout_eot_reduction=loss "
                 "so each EOT member retains the source CW objective"
             )
+    if args.pgd_guidance_teacher == "mean":
+        if args.layer1_dropout_mode == "off":
+            raise ValueError(
+                "pgd_guidance_teacher=mean requires layer1 dropout to be enabled"
+            )
+        if args.architecture_mode not in {"simple", "gpg"}:
+            raise ValueError(
+                "pgd_guidance_teacher=mean is used only by simple/gpg modes"
+            )
     for name in ("layer1_dropout_channel_ratio", "layer1_dropout_hf_ratio"):
         value = getattr(args, name)
         if not math.isfinite(value) or not 0.0 < value <= 1.0:
@@ -951,6 +975,12 @@ def _normalize_checkpoint_train_args(
     # Checkpoints written before decoder topology became configurable used the
     # shared decoder exclusively.  Preserve exact continuation for those runs.
     normalized.setdefault("decoder_mode", "shared")
+    normalized.setdefault(
+        "pgd_guidance_teacher",
+        PGD_GUIDANCE_DEFAULTS["pgd_guidance_teacher"],
+    )
+    if normalized["pgd_guidance_teacher"] not in {"shared", "mean"}:
+        raise ValueError("checkpoint pgd_guidance_teacher must be shared or mean")
     intersection_keys = set(INTERSECTION_REGULARIZATION_DEFAULTS)
     intersection_present = intersection_keys.intersection(normalized)
     if checkpoint_format in {
@@ -1683,12 +1713,87 @@ def attack_pgd(
     eps: float,
     alpha: float,
     n_iters: int,
+    guidance_teacher: str = "shared",
 ) -> torch.Tensor:
     if torch.is_autocast_enabled("cpu") or torch.is_autocast_enabled("cuda"):
         raise ValueError("attack_pgd requires CPU/CUDA autocast to be disabled")
+    if guidance_teacher not in {"shared", "mean"}:
+        raise ValueError("guidance_teacher must be shared or mean")
+    if guidance_teacher == "mean" and not isinstance(
+        model,
+        IsolatedResNet50Layer1ChannelDropoutEOT,
+    ):
+        raise ValueError("mean PGD guidance requires the layer1 dropout EOT wrapper")
     with torch.inference_mode(False), torch.enable_grad():
         delta = torch.empty_like(image).uniform_(-eps, eps)
         delta = torch.clamp(delta, -image, 1.0 - image)
+        if guidance_teacher == "mean":
+            member_count = model.eot_samples + 1
+            batch_size = image.shape[0]
+            member_deltas = delta.unsqueeze(0).expand(
+                member_count,
+                *delta.shape,
+            ).clone()
+            for _ in range(n_iters):
+                member_deltas.requires_grad_(True)
+                member_inputs = image.unsqueeze(0) + member_deltas
+                normalized_inputs = normalize_for_classifier(
+                    member_inputs.flatten(0, 1)
+                )
+                layer1_features = model._forward_to_layer1(normalized_inputs)
+                layer1_features = layer1_features.reshape(
+                    member_count,
+                    batch_size,
+                    *layer1_features.shape[1:],
+                )
+
+                dropout_features = layer1_features[1:].flatten(0, 1)
+                channel_energy = model._channel_energy(dropout_features)
+                eot_samples = model.eot_samples
+                try:
+                    # The flattened batch already contains one independent
+                    # trajectory per stochastic member.  Draw exactly one
+                    # mask per trajectory instead of materializing KxK masks.
+                    model.eot_samples = 1
+                    paired_dropout_features = model._dropout_members(
+                        dropout_features,
+                        channel_energy,
+                    )[0].reshape(
+                        eot_samples,
+                        batch_size,
+                        *dropout_features.shape[1:],
+                    )
+                finally:
+                    model.eot_samples = eot_samples
+                paired_features = torch.cat(
+                    (layer1_features[:1], paired_dropout_features),
+                    dim=0,
+                )
+                member_logits = model._forward_from_layer1(
+                    paired_features.flatten(0, 1)
+                ).reshape(member_count, batch_size, -1)
+                loss = sum(
+                    F.cross_entropy(logits, labels) for logits in member_logits
+                ) / float(member_count)
+                gradients = torch.autograd.grad(
+                    loss,
+                    member_deltas,
+                    only_inputs=True,
+                )[0]
+                member_deltas = (
+                    member_deltas.detach() + alpha * gradients.sign()
+                )
+                member_deltas = torch.clamp(
+                    member_deltas,
+                    min=-eps,
+                    max=eps,
+                )
+                member_deltas = torch.maximum(
+                    torch.minimum(member_deltas, 1.0 - image.unsqueeze(0)),
+                    -image.unsqueeze(0),
+                ).detach()
+            return member_deltas.mean(dim=0).detach()
+
         for _ in range(n_iters):
             delta.requires_grad_(True)
             loss, _ = attack_model_loss_and_logits(
@@ -3498,13 +3603,15 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
     LOGGER.info(
         "attack_objective layer1_dropout_mode=%s p=%.6g channel_ratio=%.6g "
         "hf_ratio=%.6g stochastic_members=%d clean_members=1 "
-        "eot_reduction=%s isolated_from_clean_labels_and_generator=True",
+        "eot_reduction=%s pgd_guidance_teacher=%s "
+        "isolated_from_clean_labels_and_generator=True",
         args.layer1_dropout_mode,
         args.layer1_dropout_p,
         args.layer1_dropout_channel_ratio,
         args.layer1_dropout_hf_ratio,
         args.layer1_dropout_eot_samples,
         args.layer1_dropout_eot_reduction,
+        args.pgd_guidance_teacher,
     )
     if args.layer1_dropout_mode != "off":
         LOGGER.warning(
@@ -3601,6 +3708,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     eps=grad_eps / 255.0,
                     alpha=grad_alpha / 255.0,
                     n_iters=args.n_iters,
+                    guidance_teacher=args.pgd_guidance_teacher,
                 )
 
             net_g.train()
