@@ -129,7 +129,7 @@ INFERENCE_CHECKPOINT_FORMAT = "ddsc_gpg_inference_v3"
 LEGACY_INFERENCE_CHECKPOINT_FORMAT = "ddsc_gpg_inference_v2"
 LEGACY_GPG_PARAMETER_COUNT = 8_592_516
 DEFAULT_WORKER_TIMEOUT_SECONDS = 120.0
-INTERSECTION_REGULARIZATION_DELAY_EPOCHS = 2
+INTERSECTION_REGULARIZATION_DELAY_EPOCHS = 1
 LAYER1_DROPOUT_DEFAULTS = {
     "layer1_dropout_mode": "off",
     "layer1_dropout_p": 0.7,
@@ -713,7 +713,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ddsc-warmup-epochs",
         dest="ddsc_warmup_epochs",
         type=int,
-        default=2,
+        default=3,
         help="GPG-compatible epochs with lambda-1 fixed at zero",
     )
     parser.add_argument("--ddsc_ema_decay", type=float, default=0.0)
