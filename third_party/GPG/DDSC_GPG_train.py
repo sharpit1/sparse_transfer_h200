@@ -4,14 +4,19 @@ This file is based on ``GPG_train.py``.  The legacy trainer and generator are
 left untouched.  The intended method changes are limited to:
 
 1. adapt the sparse-loss multiplier lambda-1 once per controlled epoch from
-   the observed binary spatial support; and
+   the observed binary spatial support, or explicitly keep it fixed when DDSC
+   is disabled;
 2. select the parameter-reduced ``simple`` generator or the vendored GPG,
    TSAA, or EGS-TSSA generator and preserve its source loss terms;
 3. optionally penalize current deployment-mode mask energy on the frozen
    previous epoch's deployed hard support; and
 4. optionally regularize only the attack-objective ResNet-50 with isolated
    layer1 frequency-channel dropout and clean-inclusive EOT.  The clean-label
-   path and every generator remain isolated from this classifier dropout.
+   path and every generator remain isolated from this classifier dropout; and
+5. optionally reward the strongest per-sample layer4 channel-energy changes of
+   the frozen source ResNet-50 without changing any generator-specific loss;
+   and
+6. strictly warm-start a new run from a hash-pinned raw generator state_dict.
 
 The original GPG sparse loss remains a sum, so the DDSC restoring-gain default
 is resolved in the same numerical scale as ``--lam_1``.  Values such as 2 or 4
@@ -33,7 +38,7 @@ import threading
 import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -119,7 +124,8 @@ except ImportError:
 
 LOGGER = logging.getLogger("ddsc_gpg")
 _RUN_TRAINING_LOCK = threading.Lock()
-CHECKPOINT_FORMAT = "ddsc_gpg_training_v11"
+CHECKPOINT_FORMAT = "ddsc_gpg_training_v12"
+PRE_FEATURE_ENERGY_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v11"
 PREVIOUS_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v10"
 PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v9"
 ARCHITECTURE_TRAINING_CHECKPOINT_FORMAT = "ddsc_gpg_training_v8"
@@ -154,6 +160,16 @@ INTERSECTION_REGULARIZATION_DEFAULTS = {
     "intersection_reg_lambda": 0.0,
     "intersection_reg_eps": 1.0e-12,
 }
+FEATURE_ENERGY_LOSS_DEFAULTS = {
+    "feature_energy_loss_mode": "off",
+    "feature_energy_loss_lambda": 0.0,
+}
+FEATURE_ENERGY_TOP_RATIO = 0.1
+DDSC_MODE_DEFAULTS = {"ddsc_mode": "adaptive"}
+GENERATOR_INITIALIZATION_DEFAULTS = {
+    "init_generator_checkpoint": "",
+    "init_generator_checkpoint_sha256": "",
+}
 
 # These fields change the optimization trajectory or the data presented to the
 # model.  Resume is deliberately fail-closed instead of silently mixing two
@@ -172,6 +188,9 @@ RESUME_EXACT_ARGS = (
     "lam_2",
     "lam_3",
     *INTERSECTION_REGULARIZATION_DEFAULTS,
+    *FEATURE_ENERGY_LOSS_DEFAULTS,
+    *DDSC_MODE_DEFAULTS,
+    *GENERATOR_INITIALIZATION_DEFAULTS,
     "pb",
     "seed",
     "device",
@@ -475,7 +494,8 @@ def load_controller_state(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train multi-architecture DDSC-GPG with dynamic lambda-1, optional "
+            "Train multi-architecture GPG/TSAA/EGS with optional DDSC lambda-1, "
+            "optional "
             "previous-support regularization, and a frozen ResNet-50 layer1 "
             "encoder"
         )
@@ -585,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--lam_1",
         type=float,
         default=0.0001,
-        help="initial controlled sparse-loss multiplier",
+        help="initial DDSC value, or fixed sparse-loss multiplier with DDSC off",
     )
     parser.add_argument("--lam_2", type=float, default=0.0001)
     parser.add_argument("--lam_3", type=float, default=0.0001)
@@ -595,7 +615,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="resume_lam_1_override",
         type=float,
         default=None,
-        help="override controller lambda-1 after an exact training-checkpoint restore",
+        help=(
+            "override lambda-1 after an exact training-checkpoint restore; "
+            "with DDSC off this changes the fixed sparse-loss multiplier"
+        ),
     )
     parser.add_argument(
         "--intersection_reg_mode",
@@ -626,12 +649,50 @@ def build_parser() -> argparse.ArgumentParser:
         default=INTERSECTION_REGULARIZATION_DEFAULTS["intersection_reg_eps"],
         help="positive denominator stabilizer for normalized intersection",
     )
+    parser.add_argument(
+        "--feature_energy_loss_mode",
+        "--feature-energy-loss-mode",
+        dest="feature_energy_loss_mode",
+        choices=("off", "top10_channel_energy"),
+        default=FEATURE_ENERGY_LOSS_DEFAULTS["feature_energy_loss_mode"],
+        help=(
+            "reward the per-sample top 10%% normalized layer4 channel-energy "
+            "changes of the frozen source ResNet-50"
+        ),
+    )
+    parser.add_argument(
+        "--feature_energy_loss_lambda",
+        "--feature-energy-loss-lambda",
+        dest="feature_energy_loss_lambda",
+        type=float,
+        default=FEATURE_ENERGY_LOSS_DEFAULTS["feature_energy_loss_lambda"],
+        help="non-negative multiplier for the top-10%% channel-energy reward",
+    )
     parser.add_argument("--pb", choices=("full", "half"), default="full")
     parser.add_argument("--load_CP", choices=("New", "Continue"), default="New")
     parser.add_argument(
         "--CP_path",
         default="",
         help="DDSC training sidecar (.train.pth), required for Continue",
+    )
+    parser.add_argument(
+        "--init_generator_checkpoint",
+        "--init-generator-checkpoint",
+        dest="init_generator_checkpoint",
+        default=GENERATOR_INITIALIZATION_DEFAULTS["init_generator_checkpoint"],
+        help=(
+            "raw generator state_dict used only to warm-start a New run; optimizer, "
+            "RNG, and controller state start fresh"
+        ),
+    )
+    parser.add_argument(
+        "--init_generator_checkpoint_sha256",
+        "--init-generator-checkpoint-sha256",
+        dest="init_generator_checkpoint_sha256",
+        default=GENERATOR_INITIALIZATION_DEFAULTS[
+            "init_generator_checkpoint_sha256"
+        ],
+        help="required full SHA256 for --init_generator_checkpoint",
     )
     parser.add_argument("--out-dir", default="Train_DDSC_GPG")
     parser.add_argument(
@@ -732,12 +793,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="target fraction of active spatial mask pixels",
     )
     parser.add_argument(
+        "--ddsc_mode",
+        "--ddsc-mode",
+        dest="ddsc_mode",
+        choices=("adaptive", "off"),
+        default=DDSC_MODE_DEFAULTS["ddsc_mode"],
+        help="adaptive updates lambda-1; off keeps --lam_1 fixed for every epoch",
+    )
+    parser.add_argument(
         "--ddsc_warmup_epochs",
         "--ddsc-warmup-epochs",
         dest="ddsc_warmup_epochs",
         type=int,
         default=3,
-        help="GPG-compatible epochs with lambda-1 fixed at zero",
+        help=(
+            "adaptive-mode epochs with lambda-1 fixed at zero; ignored when "
+            "--ddsc_mode off"
+        ),
     )
     parser.add_argument("--ddsc_ema_decay", type=float, default=0.0)
     parser.add_argument("--ddsc_mass", type=float, default=1.0)
@@ -858,6 +930,7 @@ def validate_args(args: argparse.Namespace) -> None:
         args.lam_2,
         args.lam_3,
         args.intersection_reg_lambda,
+        args.feature_energy_loss_lambda,
         args.egs_tsaa_stage1_lam2,
         args.egs_tsaa_stage2_lam2,
     )
@@ -895,6 +968,58 @@ def validate_args(args: argparse.Namespace) -> None:
             "intersection_reg_lambda must be positive when intersection regularization "
             "is enabled"
         )
+    if args.feature_energy_loss_mode not in {"off", "top10_channel_energy"}:
+        raise ValueError(
+            "feature_energy_loss_mode must be off or top10_channel_energy"
+        )
+    if args.feature_energy_loss_mode != "off" and args.model_type != "res50":
+        raise ValueError(
+            "top-10% channel-energy loss requires --model_type res50"
+        )
+    if (
+        args.feature_energy_loss_mode == "off"
+        and args.feature_energy_loss_lambda != 0.0
+    ):
+        raise ValueError(
+            "feature_energy_loss_lambda must be zero when feature-energy loss is off"
+        )
+    if (
+        args.feature_energy_loss_mode != "off"
+        and args.feature_energy_loss_lambda <= 0.0
+    ):
+        raise ValueError(
+            "feature_energy_loss_lambda must be positive when feature-energy loss "
+            "is enabled"
+        )
+    if args.ddsc_mode not in {"adaptive", "off"}:
+        raise ValueError("ddsc_mode must be adaptive or off")
+    if not isinstance(args.init_generator_checkpoint, (str, os.PathLike)):
+        raise ValueError("init_generator_checkpoint must be path-like")
+    args.init_generator_checkpoint = str(args.init_generator_checkpoint)
+    if not isinstance(args.init_generator_checkpoint_sha256, str):
+        raise ValueError("init_generator_checkpoint_sha256 must be a string")
+    args.init_generator_checkpoint_sha256 = (
+        args.init_generator_checkpoint_sha256.strip().lower()
+    )
+    if args.init_generator_checkpoint and not args.init_generator_checkpoint_sha256:
+        raise ValueError(
+            "init_generator_checkpoint_sha256 is required for generator warm-start"
+        )
+    if (
+        not args.init_generator_checkpoint
+        and args.init_generator_checkpoint_sha256
+    ):
+        raise ValueError(
+            "init_generator_checkpoint is required when its SHA256 is provided"
+        )
+    if args.init_generator_checkpoint_sha256 and (
+        len(args.init_generator_checkpoint_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in args.init_generator_checkpoint_sha256
+        )
+    ):
+        raise ValueError("init_generator_checkpoint_sha256 must be 64 hex characters")
     if not math.isfinite(args.egs_tsaa_tk) or not 0.0 < args.egs_tsaa_tk <= 1.0:
         raise ValueError("egs_tsaa_tk must be finite and in (0, 1]")
     if args.egs_tsaa_stage2_start_epoch < -1:
@@ -940,9 +1065,13 @@ def resolve_training_device(device_text: str) -> torch.device:
 
 def controller_config_from_args(args: argparse.Namespace) -> DDSCControllerConfig:
     gain = (
-        args.lam_1
-        if args.ddsc_restoring_gain is None
-        else args.ddsc_restoring_gain
+        0.0
+        if args.ddsc_mode == "off"
+        else (
+            args.lam_1
+            if args.ddsc_restoring_gain is None
+            else args.ddsc_restoring_gain
+        )
     )
     return validate_controller_config(
         DDSCControllerConfig(
@@ -967,7 +1096,7 @@ def _normalize_checkpoint_train_args(
     *,
     checkpoint_format: str,
 ) -> dict[str, Any]:
-    """Validate v11/v10 args or explicitly migrate v9/v8/v7/v6 checkpoints."""
+    """Validate v12 args or explicitly migrate supported v11-v6 checkpoints."""
 
     if not isinstance(stored_args, Mapping):
         raise ValueError("checkpoint train_args must be a mapping")
@@ -981,16 +1110,51 @@ def _normalize_checkpoint_train_args(
     )
     if normalized["pgd_guidance_teacher"] not in {"shared", "mean"}:
         raise ValueError("checkpoint pgd_guidance_teacher must be shared or mean")
+    feature_energy_keys = set(FEATURE_ENERGY_LOSS_DEFAULTS)
+    feature_energy_present = feature_energy_keys.intersection(normalized)
+    if feature_energy_present and feature_energy_present != feature_energy_keys:
+        missing = sorted(feature_energy_keys - feature_energy_present)
+        raise ValueError(
+            "checkpoint feature-energy arguments are incomplete: "
+            f"missing={missing}"
+        )
+    if checkpoint_format == CHECKPOINT_FORMAT and not feature_energy_present:
+        raise ValueError(
+            f"{CHECKPOINT_FORMAT} feature-energy arguments are incomplete: "
+            f"missing={sorted(feature_energy_keys)}"
+        )
+    if checkpoint_format != CHECKPOINT_FORMAT and not feature_energy_present:
+        normalized.update(FEATURE_ENERGY_LOSS_DEFAULTS)
+    for defaults, label in (
+        (DDSC_MODE_DEFAULTS, "DDSC-mode"),
+        (GENERATOR_INITIALIZATION_DEFAULTS, "generator-initialization"),
+    ):
+        keys = set(defaults)
+        present = keys.intersection(normalized)
+        if present and present != keys:
+            raise ValueError(
+                f"checkpoint {label} arguments are incomplete: "
+                f"missing={sorted(keys - present)}"
+            )
+        if checkpoint_format == CHECKPOINT_FORMAT and not present:
+            raise ValueError(
+                f"{CHECKPOINT_FORMAT} {label} arguments are incomplete: "
+                f"missing={sorted(keys)}"
+            )
+        if checkpoint_format != CHECKPOINT_FORMAT and not present:
+            normalized.update(defaults)
     intersection_keys = set(INTERSECTION_REGULARIZATION_DEFAULTS)
     intersection_present = intersection_keys.intersection(normalized)
     if checkpoint_format in {
         CHECKPOINT_FORMAT,
+        PRE_FEATURE_ENERGY_TRAINING_CHECKPOINT_FORMAT,
         PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
     }:
         if intersection_present != intersection_keys:
             missing = sorted(intersection_keys - intersection_present)
             raise ValueError(
-                f"{checkpoint_format} intersection-regularization arguments "
+                f"v11+ checkpoint ({checkpoint_format}) intersection-regularization "
+                "arguments "
                 "are incomplete: "
                 f"missing={missing}"
             )
@@ -1007,6 +1171,7 @@ def _normalize_checkpoint_train_args(
     architecture_present = architecture_keys.intersection(normalized)
     if checkpoint_format in {
         CHECKPOINT_FORMAT,
+        PRE_FEATURE_ENERGY_TRAINING_CHECKPOINT_FORMAT,
         PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
         PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT,
         ARCHITECTURE_TRAINING_CHECKPOINT_FORMAT,
@@ -1078,6 +1243,10 @@ def experiment_fingerprint(
 ) -> str:
     contract = {key: getattr(args, key) for key in RESUME_EXACT_ARGS}
     contract["train_dir"] = str(Path(args.train_dir).expanduser().resolve())
+    if contract["init_generator_checkpoint"]:
+        contract["init_generator_checkpoint"] = str(
+            Path(contract["init_generator_checkpoint"]).expanduser().resolve()
+        )
     contract["controller_config"] = asdict(controller_config)
     canonical = json.dumps(
         contract,
@@ -1088,7 +1257,9 @@ def experiment_fingerprint(
     return hashlib.sha256(canonical).hexdigest()[:12]
 
 
-def file_fingerprint(path: str | os.PathLike[str]) -> str:
+def file_sha256(path: str | os.PathLike[str]) -> str:
+    """Return the complete SHA256 of a local file using bounded memory."""
+
     digest = hashlib.sha256()
     try:
         with Path(path).open("rb") as checkpoint_file:
@@ -1099,7 +1270,11 @@ def file_fingerprint(path: str | os.PathLike[str]) -> str:
                 digest.update(chunk)
     except OSError as exc:
         raise ValueError(f"cannot fingerprint checkpoint {path!s}: {exc}") from exc
-    return digest.hexdigest()[:12]
+    return digest.hexdigest()
+
+
+def file_fingerprint(path: str | os.PathLike[str]) -> str:
+    return file_sha256(path)[:12]
 
 
 def runtime_contract(device: torch.device) -> dict[str, Any]:
@@ -1450,6 +1625,85 @@ def build_attack_objective_model(
         eot_samples=args.layer1_dropout_eot_samples,
         eot_reduction=args.layer1_dropout_eot_reduction,
     )
+
+
+@contextmanager
+def capture_resnet_layer4_features(
+    model: torch.nn.Module,
+) -> Iterator[list[torch.Tensor]]:
+    """Capture one frozen source-ResNet layer4 output without changing its forward."""
+
+    layer4 = getattr(model, "layer4", None)
+    if not isinstance(layer4, torch.nn.Module):
+        raise ValueError("feature-energy loss requires a torchvision-style ResNet")
+    captured: list[torch.Tensor] = []
+
+    def capture(
+        _module: torch.nn.Module,
+        _inputs: tuple[torch.Tensor, ...],
+        output: Any,
+    ) -> None:
+        if not isinstance(output, torch.Tensor):
+            raise TypeError("ResNet layer4 must return a tensor")
+        captured.append(output)
+
+    handle = layer4.register_forward_hook(capture)
+    try:
+        yield captured
+    finally:
+        handle.remove()
+
+
+def captured_resnet_layer4_batch(
+    captured: Sequence[torch.Tensor],
+    *,
+    batch_size: int,
+) -> torch.Tensor:
+    """Return the unmodified member from one source-ResNet layer4 forward."""
+
+    if len(captured) != 1:
+        raise RuntimeError(
+            "feature-energy loss expected exactly one source-ResNet layer4 forward"
+        )
+    feature = captured[0]
+    if feature.ndim != 4 or feature.shape[0] < batch_size:
+        raise RuntimeError("captured source-ResNet layer4 feature has an invalid shape")
+    if feature.shape[0] % batch_size != 0:
+        raise RuntimeError(
+            "captured source-ResNet layer4 batch is incompatible with the input batch"
+        )
+    # The dropout-EOT wrapper places its unmodified member first.  With dropout
+    # disabled, this slice is the complete batch.
+    return feature[:batch_size]
+
+
+def top10_channel_energy_reward(
+    clean_feature: torch.Tensor,
+    adversarial_feature: torch.Tensor,
+    *,
+    eps: float = 1.0e-12,
+) -> torch.Tensor:
+    """Reward per-sample top-10% layer4 channel changes relative to clean scale."""
+
+    if clean_feature.ndim != 4 or clean_feature.shape != adversarial_feature.shape:
+        raise ValueError("clean/adversarial features must have the same BxCxHxW shape")
+    if clean_feature.shape[1] <= 0:
+        raise ValueError("feature tensors must contain at least one channel")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("feature-energy eps must be finite and positive")
+
+    clean = clean_feature.detach()
+    channel_energy = (adversarial_feature - clean).square().mean(dim=(-2, -1))
+    clean_scale = clean.square().mean(dim=(1, 2, 3)).unsqueeze(1).clamp_min(eps)
+    normalized_energy = channel_energy / clean_scale
+    top_count = max(1, math.ceil(normalized_energy.shape[1] * FEATURE_ENERGY_TOP_RATIO))
+    top_indices = torch.topk(
+        normalized_energy.detach(),
+        k=top_count,
+        dim=1,
+    ).indices
+    top_energy = normalized_energy.gather(1, top_indices)
+    return torch.log1p(top_energy).mean()
 
 
 def hard_spatial_support(continuous_mask: torch.Tensor) -> torch.Tensor:
@@ -2092,6 +2346,57 @@ def _validate_module_state_schema_exact(
             )
 
 
+def load_raw_generator_initialization(
+    generator: torch.nn.Module,
+    path: str | os.PathLike[str],
+    *,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Strictly warm-start a generator from a hash-pinned raw state_dict."""
+
+    resolved_path = Path(path).expanduser().resolve()
+    actual_sha256 = file_sha256(resolved_path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "generator initialization checkpoint SHA256 mismatch: "
+            f"expected={expected_sha256}, actual={actual_sha256}"
+        )
+    try:
+        with torch.inference_mode(False):
+            state_dict = torch.load(
+                resolved_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"cannot read generator initialization checkpoint: {resolved_path}"
+        ) from exc
+    if not isinstance(state_dict, Mapping):
+        raise ValueError("generator initialization checkpoint must be a raw state_dict")
+    validate_module_state_dict_finite(
+        state_dict,
+        field_name="generator_initialization_state_dict",
+    )
+    _validate_module_state_schema_exact(
+        state_dict,
+        generator.state_dict(),
+        field_name="generator_initialization_state_dict",
+    )
+    generator.load_state_dict(state_dict, strict=True)
+    validate_module_state_dict_finite(
+        generator.state_dict(),
+        field_name="initialized_generator_state_dict",
+    )
+    return {
+        "schema": 1,
+        "kind": "raw_generator_state_dict",
+        "path": str(resolved_path),
+        "sha256": actual_sha256,
+        "state_entries": len(state_dict),
+    }
+
+
 def _values_equal_exact(left: Any, right: Any) -> bool:
     """Compare checkpoint values without Python's cross-type equality."""
 
@@ -2368,6 +2673,7 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
         path,
         expected_formats=(
             CHECKPOINT_FORMAT,
+            PRE_FEATURE_ENERGY_TRAINING_CHECKPOINT_FORMAT,
             PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
             PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT,
             ARCHITECTURE_TRAINING_CHECKPOINT_FORMAT,
@@ -2396,6 +2702,7 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
     required = set(legacy_required)
     if checkpoint_format in {
         CHECKPOINT_FORMAT,
+        PRE_FEATURE_ENERGY_TRAINING_CHECKPOINT_FORMAT,
         PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
         PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT,
     }:
@@ -2465,6 +2772,7 @@ def load_training_checkpoint(path: str | os.PathLike[str]) -> Mapping[str, Any]:
     architecture_mode = payload["train_args"]["architecture_mode"]
     if checkpoint_format not in {
         CHECKPOINT_FORMAT,
+        PRE_FEATURE_ENERGY_TRAINING_CHECKPOINT_FORMAT,
         PREVIOUS_TRAINING_CHECKPOINT_FORMAT,
         PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT,
     }:
@@ -2729,9 +3037,11 @@ def validate_resume_metadata(
     for key in RESUME_EXACT_ARGS:
         stored_value = stored_args.get(key)
         requested_value = getattr(args, key)
-        if key == "train_dir":
+        if key == "train_dir" or (
+            key == "init_generator_checkpoint" and stored_value
+        ):
             if not isinstance(stored_value, (str, os.PathLike)):
-                raise ValueError("resume train_dir must be path-like")
+                raise ValueError(f"resume {key} must be path-like")
             stored_value = str(Path(stored_value).expanduser().resolve())
             requested_value = str(Path(requested_value).expanduser().resolve())
         if not _values_equal_exact(stored_value, requested_value):
@@ -2767,12 +3077,20 @@ def validate_resume_metadata(
     if next_epoch > stored_epochs:
         raise ValueError("checkpoint next_epoch exceeds its stored epoch budget")
     state = load_controller_state(payload["controller_state"], controller_config)
-    expected_updates = max(0, next_epoch - args.ddsc_warmup_epochs)
+    expected_updates = (
+        0
+        if args.ddsc_mode == "off"
+        else max(0, next_epoch - args.ddsc_warmup_epochs)
+    )
     if state.update_index != expected_updates:
         raise ValueError(
             "controller update_index is inconsistent with the epoch boundary"
         )
-    if expected_updates == 0 and state != initial_controller_state(controller_config):
+    if (
+        expected_updates == 0
+        and args.ddsc_mode != "off"
+        and state != initial_controller_state(controller_config)
+    ):
         raise ValueError("warm-up checkpoint contains a modified controller state")
     image_size = 299 if args.model_type == "incv3" else 224
     target_k = max(1, round(args.ddsc_target_density * image_size * image_size))
@@ -3314,6 +3632,8 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         resume_payload = load_training_checkpoint(args.CP_path)
         validate_resume_metadata(resume_payload, args, controller_config)
         lineage_fingerprint = file_fingerprint(args.CP_path)
+    elif args.init_generator_checkpoint:
+        lineage_fingerprint = args.init_generator_checkpoint_sha256[:12]
 
     if args.architecture_mode == "simple":
         architecture_label = (
@@ -3384,6 +3704,14 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         )
         if args.architecture_mode == "egs_tsaa":
             setattr(net_g, "ddsc_egs_tk", float(args.egs_tsaa_tk))
+
+    initialization_contract: Mapping[str, Any] | None = None
+    if resume_payload is None and args.init_generator_checkpoint:
+        initialization_contract = load_raw_generator_initialization(
+            net_g,
+            args.init_generator_checkpoint,
+            expected_sha256=args.init_generator_checkpoint_sha256,
+        )
 
     clean_attack_model.requires_grad_(False)
     clean_attack_model.eval().to(device)
@@ -3483,6 +3811,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
     previous_net_g: torch.nn.Module | None = None
     if args.intersection_reg_mode != "off" and start_epoch > 0:
         previous_net_g = frozen_generator_snapshot(net_g)
+    feature_energy_enabled = args.feature_energy_loss_mode != "off"
     intersection_activation_epoch = (
         args.ddsc_warmup_epochs + INTERSECTION_REGULARIZATION_DELAY_EPOCHS
     )
@@ -3545,8 +3874,14 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         raise
     LOGGER.info("args=%s", args)
     LOGGER.info("controller_config=%s", controller_config)
+    LOGGER.info("generator_initialization=%s", initialization_contract)
     LOGGER.info("target_k=%d image_size=%d", target_k, image_size)
-    if args.epochs <= args.ddsc_warmup_epochs:
+    if args.ddsc_mode == "off":
+        LOGGER.info(
+            "ddsc_mode=off lambda1_fixed=%.9g warmup_and_controller_updates=False",
+            controller_state.lambda1,
+        )
+    elif args.epochs <= args.ddsc_warmup_epochs:
         LOGGER.warning(
             "epoch budget ends during lambda1 warm-up; no controlled epoch runs"
         )
@@ -3619,6 +3954,14 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             "batch_size or EOT samples if memory is insufficient",
             args.layer1_dropout_eot_samples + 1,
         )
+    LOGGER.info(
+        "feature_energy_loss mode=%s lambda=%.9g layer=layer4 top_ratio=%.6g "
+        "energy=mean_hw_squared_delta normalization=clean_mean_chw_squared "
+        "reward=mean_log1p_topk source_model_only=True",
+        args.feature_energy_loss_mode,
+        args.feature_energy_loss_lambda,
+        FEATURE_ENERGY_TOP_RATIO,
+    )
     LOGGER.info("dataset_contract=%s", dataset_manifest)
     LOGGER.info(
         "data_loader num_workers=%d persistent_workers=%s "
@@ -3629,10 +3972,14 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
     )
 
     for epoch in range(start_epoch, args.epochs):
-        lambda1_applied = lambda1_for_epoch(
-            epoch,
-            args.ddsc_warmup_epochs,
-            controller_state,
+        lambda1_applied = (
+            float(controller_state.lambda1)
+            if args.ddsc_mode == "off"
+            else lambda1_for_epoch(
+                epoch,
+                args.ddsc_warmup_epochs,
+                controller_state,
+            )
         )
         intersection_active = (
             args.intersection_reg_mode != "off"
@@ -3661,6 +4008,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         hard_rcurr_percent_sum = 0.0
         hard_jaccard_percent_sum = 0.0
         hard_overlap_samples = 0
+        feature_energy_reward_sum = 0.0
         last_metrics: dict[str, float] = {}
 
         # Match the historical one-base-seed-per-epoch sampler transition while
@@ -3677,15 +4025,31 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             image = image.to(device, non_blocking=True)
             ground_truth = ground_truth.to(device, non_blocking=True)
             structured_mask: torch.Tensor | None = None
-            if args.architecture_mode == "egs_tsaa":
-                if egs_conditioner is None:
-                    raise RuntimeError("EGS-TSSA conditioner was not initialized")
-                clean_logits, structured_mask = egs_conditioner.clean_logits_and_mask(
-                    normalize_for_classifier(image)
-                )
-            else:
-                with torch.no_grad():
-                    clean_logits = clean_attack_model(normalize_for_classifier(image))
+            clean_capture_context = (
+                capture_resnet_layer4_features(clean_attack_model)
+                if feature_energy_enabled
+                else nullcontext(None)
+            )
+            with clean_capture_context as clean_capture:
+                if args.architecture_mode == "egs_tsaa":
+                    if egs_conditioner is None:
+                        raise RuntimeError("EGS-TSSA conditioner was not initialized")
+                    clean_logits, structured_mask = egs_conditioner.clean_logits_and_mask(
+                        normalize_for_classifier(image)
+                    )
+                else:
+                    with torch.no_grad():
+                        clean_logits = clean_attack_model(
+                            normalize_for_classifier(image)
+                        )
+            clean_layer4_feature = (
+                captured_resnet_layer4_batch(
+                    clean_capture,
+                    batch_size=image.shape[0],
+                ).detach()
+                if clean_capture is not None
+                else None
+            )
             clean_prediction = clean_logits.argmax(dim=-1)
             if args.target == -1:
                 attack_label = clean_prediction
@@ -3778,15 +4142,34 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                         eps=args.intersection_reg_eps,
                     )
             objective_cw = cw_loss if args.architecture_mode == "simple" else legacy_cw_loss
-            loss_adv, adv_logits = attack_model_loss_and_logits(
-                attack_objective_model,
-                normalize_for_classifier(adv),
-                lambda logits: objective_cw(
-                    logits,
-                    attack_label,
-                    targeted=args.target != -1,
-                ),
+            adversarial_capture_context = (
+                capture_resnet_layer4_features(clean_attack_model)
+                if feature_energy_enabled
+                else nullcontext(None)
             )
+            with adversarial_capture_context as adversarial_capture:
+                loss_adv, adv_logits = attack_model_loss_and_logits(
+                    attack_objective_model,
+                    normalize_for_classifier(adv),
+                    lambda logits: objective_cw(
+                        logits,
+                        attack_label,
+                        targeted=args.target != -1,
+                    ),
+                )
+            if adversarial_capture is not None:
+                if clean_layer4_feature is None:
+                    raise RuntimeError("clean layer4 feature was not captured")
+                adversarial_layer4_feature = captured_resnet_layer4_batch(
+                    adversarial_capture,
+                    batch_size=image.shape[0],
+                )
+                feature_energy_reward = top10_channel_energy_reward(
+                    clean_layer4_feature,
+                    adversarial_layer4_feature,
+                )
+            else:
+                feature_energy_reward = loss_adv.new_zeros(())
             adv_prediction = adv_logits.detach().argmax(dim=-1)
             if args.target == -1:
                 batch_fool_count = int(
@@ -3838,7 +4221,10 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             intersection_weighted = (
                 intersection_lambda_applied * intersection_loss
             )
-            loss = loss + intersection_weighted
+            feature_energy_weighted = (
+                -args.feature_energy_loss_lambda * feature_energy_reward
+            )
+            loss = loss + intersection_weighted + feature_energy_weighted
             loss.backward()
             optimizer.step()
 
@@ -3849,6 +4235,10 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             fool_count_epoch += batch_fool_count
             window_fool_count += batch_fool_count
             window_samples += batch_size_actual
+            if feature_energy_enabled:
+                feature_energy_reward_sum += (
+                    float(feature_energy_reward.detach()) * batch_size_actual
+                )
             if previous_net_g is not None:
                 intersection_sum += float(intersection_loss.detach())
                 intersection_samples += batch_size_actual
@@ -3883,6 +4273,8 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     "intersection": float(intersection_loss.detach()),
                     "intersection_weighted": float(intersection_weighted.detach()),
                     "intersection_active": float(intersection_active),
+                    "feature_energy_reward": float(feature_energy_reward.detach()),
+                    "feature_energy_weighted": float(feature_energy_weighted.detach()),
                     "l0": float(batch_support.to(dtype=torch.float64).mean().item()),
                     "l1": float(
                         (torch.norm(perturbation, p=1) / batch_size_actual).item()
@@ -3920,6 +4312,16 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     intersection_active,
                     last_metrics["fool_rate_window"],
                 )
+                if feature_energy_enabled:
+                    LOGGER.info(
+                        "FEATURE_ENERGY_BATCH epoch=%d batch=%d reward=%.9g "
+                        "weighted_loss=%.9g layer=layer4 top_ratio=%.6g",
+                        epoch,
+                        batch_index,
+                        last_metrics["feature_energy_reward"],
+                        last_metrics["feature_energy_weighted"],
+                        FEATURE_ENERGY_TOP_RATIO,
+                    )
                 if hard_overlap_metrics is not None:
                     LOGGER.info(
                         "HARD_OVERLAP_BATCH epoch=%d batch=%d "
@@ -3956,6 +4358,11 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             if intersection_samples > 0
             else 0.0
         )
+        mean_feature_energy_reward = (
+            feature_energy_reward_sum / support_samples
+            if feature_energy_enabled
+            else 0.0
+        )
         print(
             f"running:{epoch} | FR-{args.model_type}:{fool_rate_epoch:.6f} | "
             f"lambda1:{lambda1_applied:.9g} | support:{observed_k:.3f}/"
@@ -3977,6 +4384,15 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             intersection_active,
             intersection_lambda_applied,
         )
+        if feature_energy_enabled:
+            LOGGER.info(
+                "FEATURE_ENERGY_EPOCH epoch=%d reward=%.9g weighted_loss=%.9g "
+                "layer=layer4 top_ratio=%.6g",
+                epoch,
+                mean_feature_energy_reward,
+                -args.feature_energy_loss_lambda * mean_feature_energy_reward,
+                FEATURE_ENERGY_TOP_RATIO,
+            )
         LOGGER.info(
             "HARD_OVERLAP_EPOCH epoch=%d hard_intersection_density=%.9g "
             "Rprev=%.9g Rcurr=%.9g Jaccard=%.9g threshold=0.5 "
@@ -4004,22 +4420,28 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             ),
         )
 
-        controller_state, diagnostics = update_controller_after_epoch(
-            epoch=epoch,
-            warmup_epochs=args.ddsc_warmup_epochs,
-            state=controller_state,
-            config=controller_config,
-            observed_k=observed_k,
-            target_k=target_k,
-        )
-        if diagnostics is not None:
-            LOGGER.info("controller_update=%s", diagnostics)
-        else:
+        if args.ddsc_mode == "off":
             LOGGER.info(
-                "controller_update=skipped warmup_epoch=%d/%d",
-                epoch + 1,
-                args.ddsc_warmup_epochs,
+                "controller_update=disabled lambda1_fixed=%.9g",
+                lambda1_applied,
             )
+        else:
+            controller_state, diagnostics = update_controller_after_epoch(
+                epoch=epoch,
+                warmup_epochs=args.ddsc_warmup_epochs,
+                state=controller_state,
+                config=controller_config,
+                observed_k=observed_k,
+                target_k=target_k,
+            )
+            if diagnostics is not None:
+                LOGGER.info("controller_update=%s", diagnostics)
+            else:
+                LOGGER.info(
+                    "controller_update=skipped warmup_epoch=%d/%d",
+                    epoch + 1,
+                    args.ddsc_warmup_epochs,
+                )
 
         if (
             args.intersection_reg_mode != "off"
@@ -4095,6 +4517,10 @@ __all__ = [
     "ARCHITECTURE_TRAINING_CHECKPOINT_FORMAT",
     "CHECKPOINT_FORMAT",
     "DEFAULT_WORKER_TIMEOUT_SECONDS",
+    "DDSC_MODE_DEFAULTS",
+    "FEATURE_ENERGY_LOSS_DEFAULTS",
+    "FEATURE_ENERGY_TOP_RATIO",
+    "GENERATOR_INITIALIZATION_DEFAULTS",
     "INFERENCE_CHECKPOINT_FORMAT",
     "INTERSECTION_REGULARIZATION_DELAY_EPOCHS",
     "INTERSECTION_REGULARIZATION_DEFAULTS",
@@ -4103,6 +4529,7 @@ __all__ = [
     "LEGACY_INFERENCE_CHECKPOINT_FORMAT",
     "LEGACY_TRAINING_CHECKPOINT_FORMAT",
     "PRE_INTERSECTION_TRAINING_CHECKPOINT_FORMAT",
+    "PRE_FEATURE_ENERGY_TRAINING_CHECKPOINT_FORMAT",
     "PREVIOUS_TRAINING_CHECKPOINT_FORMAT",
     "DDSCControllerConfig",
     "DDSCControllerState",
@@ -4118,6 +4545,8 @@ __all__ = [
     "build_parser",
     "build_training_data_loader",
     "capture_rng_state",
+    "capture_resnet_layer4_features",
+    "captured_resnet_layer4_batch",
     "controller_config_from_args",
     "controller_support_mask",
     "cw_loss",
@@ -4126,6 +4555,7 @@ __all__ = [
     "experiment_fingerprint",
     "expected_adam_group_options",
     "expected_optimizer_step",
+    "file_sha256",
     "file_fingerprint",
     "generator_deployment_mask_mode",
     "hard_spatial_support",
@@ -4140,6 +4570,7 @@ __all__ = [
     "legacy_cw_loss",
     "load_controller_state",
     "load_inference_checkpoint",
+    "load_raw_generator_initialization",
     "load_training_checkpoint",
     "main",
     "normalize_for_classifier",
@@ -4152,6 +4583,7 @@ __all__ = [
     "save_epoch_checkpoints",
     "seed_everything",
     "temporal_overlap_mask",
+    "top10_channel_energy_reward",
     "update_controller_after_epoch",
     "validate_controller_config",
     "validate_controller_state",
