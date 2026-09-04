@@ -16,7 +16,10 @@ left untouched.  The intended method changes are limited to:
 5. optionally reward the strongest per-sample layer4 channel-energy changes of
    the frozen source ResNet-50 without changing any generator-specific loss;
    and
-6. strictly warm-start a new run from a hash-pinned raw generator state_dict.
+6. optionally record each image's clean layer1 high-frequency Top-30% channels
+   during epoch 0 and reward only those adversarial channels for every generator
+   architecture; and
+7. strictly warm-start a new run from a hash-pinned raw generator state_dict.
 
 The original GPG sparse loss remains a sum, so the DDSC restoring-gain default
 is resolved in the same numerical scale as ``--lam_1``.  Values such as 2 or 4
@@ -54,6 +57,32 @@ import torchvision.utils as vutils
 from PIL import __version__ as PILLOW_VERSION
 from torch.utils.data import Subset
 from tqdm import tqdm
+try:
+    from .fixed_layer1_hf_energy import (
+        DEFAULT_CHANNEL_RATIO,
+        DEFAULT_LOW_FREQUENCY_RATIO,
+        DEFAULT_RIDGE_FRACTION,
+        IndexedDataset,
+        OnlinePerImageLayer1HighFrequencyEnergy,
+        calibration_cache_sha256,
+        capture_resnet_layer1_features,
+        captured_resnet_layer1_batch,
+        load_calibration_cache,
+        save_calibration_cache,
+    )
+except ImportError:
+    from fixed_layer1_hf_energy import (  # type: ignore[no-redef]
+        DEFAULT_CHANNEL_RATIO,
+        DEFAULT_LOW_FREQUENCY_RATIO,
+        DEFAULT_RIDGE_FRACTION,
+        IndexedDataset,
+        OnlinePerImageLayer1HighFrequencyEnergy,
+        calibration_cache_sha256,
+        capture_resnet_layer1_features,
+        captured_resnet_layer1_batch,
+        load_calibration_cache,
+        save_calibration_cache,
+    )
 
 try:
     from .generators_ddsc_gpg import (
@@ -165,6 +194,13 @@ FEATURE_ENERGY_LOSS_DEFAULTS = {
     "feature_energy_loss_lambda": 0.0,
 }
 FEATURE_ENERGY_TOP_RATIO = 0.1
+FIXED_LAYER1_HF_MODE = 'fixed_per_image_layer1_hf_top30_abs'
+LAYER1_HF_DEFAULTS = {
+    'layer1_hf_channel_ratio': DEFAULT_CHANNEL_RATIO,
+    'layer1_hf_low_frequency_ratio': DEFAULT_LOW_FREQUENCY_RATIO,
+    'layer1_hf_ridge_fraction': DEFAULT_RIDGE_FRACTION,
+    'layer1_hf_calibration_sha256': '',
+}
 DDSC_MODE_DEFAULTS = {"ddsc_mode": "adaptive"}
 GENERATOR_INITIALIZATION_DEFAULTS = {
     "init_generator_checkpoint": "",
@@ -189,6 +225,7 @@ RESUME_EXACT_ARGS = (
     "lam_3",
     *INTERSECTION_REGULARIZATION_DEFAULTS,
     *FEATURE_ENERGY_LOSS_DEFAULTS,
+    *LAYER1_HF_DEFAULTS,
     *DDSC_MODE_DEFAULTS,
     *GENERATOR_INITIALIZATION_DEFAULTS,
     "pb",
@@ -653,11 +690,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--feature_energy_loss_mode",
         "--feature-energy-loss-mode",
         dest="feature_energy_loss_mode",
-        choices=("off", "top10_channel_energy"),
+        choices=("off", "top10_channel_energy", FIXED_LAYER1_HF_MODE),
         default=FEATURE_ENERGY_LOSS_DEFAULTS["feature_energy_loss_mode"],
         help=(
-            "reward the per-sample top 10%% normalized layer4 channel-energy "
-            "changes of the frozen source ResNet-50"
+            "top10_channel_energy preserves the existing per-sample layer4 "
+            "change reward; fixed_per_image_layer1_hf_top30_abs selects "
+            "each image's clean-ranked layer1 channels once and rewards "
+            "their absolute adversarial dropout-style high-frequency "
+            "energy"
         ),
     )
     parser.add_argument(
@@ -666,7 +706,30 @@ def build_parser() -> argparse.ArgumentParser:
         dest="feature_energy_loss_lambda",
         type=float,
         default=FEATURE_ENERGY_LOSS_DEFAULTS["feature_energy_loss_lambda"],
-        help="non-negative multiplier for the top-10%% channel-energy reward",
+        help="non-negative multiplier for the selected feature-energy reward",
+    )
+    parser.add_argument(
+        '--layer1_hf_channel_ratio', type=float,
+        default=LAYER1_HF_DEFAULTS['layer1_hf_channel_ratio'],
+        help='per-image fraction of channels selected by clean HF energy',
+    )
+    parser.add_argument(
+        '--layer1_hf_low_frequency_ratio', type=float,
+        default=LAYER1_HF_DEFAULTS['layer1_hf_low_frequency_ratio'],
+        help='dropout-style centered low-frequency ratio removed',
+    )
+    parser.add_argument(
+        '--layer1_hf_ridge_fraction', type=float,
+        default=LAYER1_HF_DEFAULTS['layer1_hf_ridge_fraction'],
+        help='ridge as a fraction of selected clean median energy',
+    )
+    parser.add_argument(
+        '--layer1_hf_calibration_path', default='',
+        help='validated per-image tensor cache; required for Continue',
+    )
+    parser.add_argument(
+        '--layer1_hf_calibration_sha256', default='',
+        help='byte-exact calibration-cache SHA-256; required when loading',
     )
     parser.add_argument("--pb", choices=("full", "half"), default="full")
     parser.add_argument("--load_CP", choices=("New", "Continue"), default="New")
@@ -968,14 +1031,16 @@ def validate_args(args: argparse.Namespace) -> None:
             "intersection_reg_lambda must be positive when intersection regularization "
             "is enabled"
         )
-    if args.feature_energy_loss_mode not in {"off", "top10_channel_energy"}:
+    valid_feature_energy_modes = {
+        'off', 'top10_channel_energy', FIXED_LAYER1_HF_MODE
+    }
+    if args.feature_energy_loss_mode not in valid_feature_energy_modes:
         raise ValueError(
-            "feature_energy_loss_mode must be off or top10_channel_energy"
+            'feature_energy_loss_mode must be one of '
+            f'{sorted(valid_feature_energy_modes)}'
         )
-    if args.feature_energy_loss_mode != "off" and args.model_type != "res50":
-        raise ValueError(
-            "top-10% channel-energy loss requires --model_type res50"
-        )
+    if args.feature_energy_loss_mode != 'off' and args.model_type != 'res50':
+        raise ValueError('feature-energy loss requires --model_type res50')
     if (
         args.feature_energy_loss_mode == "off"
         and args.feature_energy_loss_lambda != 0.0
@@ -990,6 +1055,61 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "feature_energy_loss_lambda must be positive when feature-energy loss "
             "is enabled"
+        )
+    for name in ('layer1_hf_channel_ratio', 'layer1_hf_low_frequency_ratio'):
+        value = getattr(args, name)
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            raise ValueError(f'{name} must be finite and in (0, 1]')
+    if (
+        not math.isfinite(args.layer1_hf_ridge_fraction)
+        or args.layer1_hf_ridge_fraction < 0.0
+    ):
+        raise ValueError('layer1_hf_ridge_fraction must be finite and non-negative')
+    if (
+        args.feature_energy_loss_mode == FIXED_LAYER1_HF_MODE
+        and args.load_CP == 'Continue'
+        and (
+            not args.layer1_hf_calibration_path
+            or not args.layer1_hf_calibration_sha256
+        )
+    ):
+        raise ValueError(
+            'Continue in fixed layer1 HF mode requires '
+            '--layer1_hf_calibration_path and '
+            '--layer1_hf_calibration_sha256 from the preceding stage'
+        )
+    if not isinstance(args.layer1_hf_calibration_sha256, str):
+        raise ValueError('layer1_hf_calibration_sha256 must be a string')
+    args.layer1_hf_calibration_sha256 = (
+        args.layer1_hf_calibration_sha256.strip().lower()
+    )
+    if args.layer1_hf_calibration_sha256 and (
+        len(args.layer1_hf_calibration_sha256) != 64
+        or any(
+            character not in '0123456789abcdef'
+            for character in args.layer1_hf_calibration_sha256
+        )
+    ):
+        raise ValueError(
+            'layer1_hf_calibration_sha256 must be 64 lowercase hex characters'
+        )
+    if (
+        args.feature_energy_loss_mode == FIXED_LAYER1_HF_MODE
+        and bool(args.layer1_hf_calibration_path)
+        != bool(args.layer1_hf_calibration_sha256)
+    ):
+        raise ValueError(
+            'layer1 HF calibration path and SHA-256 must be provided together'
+        )
+    if (
+        args.feature_energy_loss_mode != FIXED_LAYER1_HF_MODE
+        and (
+            args.layer1_hf_calibration_path
+            or args.layer1_hf_calibration_sha256
+        )
+    ):
+        raise ValueError(
+            'layer1_hf_calibration_path is valid only in fixed layer1 HF mode'
         )
     if args.ddsc_mode not in {"adaptive", "off"}:
         raise ValueError("ddsc_mode must be adaptive or off")
@@ -1101,6 +1221,8 @@ def _normalize_checkpoint_train_args(
     if not isinstance(stored_args, Mapping):
         raise ValueError("checkpoint train_args must be a mapping")
     normalized = dict(stored_args)
+    for key, value in LAYER1_HF_DEFAULTS.items():
+        normalized.setdefault(key, value)
     # Checkpoints written before decoder topology became configurable used the
     # shared decoder exclusively.  Preserve exact continuation for those runs.
     normalized.setdefault("decoder_mode", "shared")
@@ -3811,7 +3933,13 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
     previous_net_g: torch.nn.Module | None = None
     if args.intersection_reg_mode != "off" and start_epoch > 0:
         previous_net_g = frozen_generator_snapshot(net_g)
-    feature_energy_enabled = args.feature_energy_loss_mode != "off"
+    layer4_feature_energy_enabled = (
+        args.feature_energy_loss_mode == 'top10_channel_energy'
+    )
+    layer1_hf_enabled = (
+        args.feature_energy_loss_mode == FIXED_LAYER1_HF_MODE
+    )
+    feature_energy_enabled = layer4_feature_energy_enabled or layer1_hf_enabled
     intersection_activation_epoch = (
         args.ddsc_warmup_epochs + INTERSECTION_REGULARIZATION_DELAY_EPOCHS
     )
@@ -3839,6 +3967,47 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             resume_payload["dataset_contract"],
             dataset_manifest,
         )
+    layer1_hf_objective = None
+    layer1_hf_calibration_loaded = False
+    if layer1_hf_enabled:
+        calibration_kwargs = {
+            'source_model_sha256': current_attack_model_contract['state_sha256'],
+            'dataset_sha256': dataset_manifest['sha256'],
+            'dataset_size': len(train_set),
+            'channel_ratio': args.layer1_hf_channel_ratio,
+            'low_frequency_ratio': args.layer1_hf_low_frequency_ratio,
+            'ridge_fraction': args.layer1_hf_ridge_fraction,
+        }
+        layer1_hf_calibration = None
+        if args.layer1_hf_calibration_path:
+            observed_calibration_sha256 = calibration_cache_sha256(
+                args.layer1_hf_calibration_path
+            )
+            if observed_calibration_sha256 != args.layer1_hf_calibration_sha256:
+                raise ValueError(
+                    'layer1 HF calibration SHA-256 mismatch: '
+                    f'expected={args.layer1_hf_calibration_sha256}, '
+                    f'observed={observed_calibration_sha256}'
+                )
+            layer1_hf_calibration = load_calibration_cache(
+                args.layer1_hf_calibration_path,
+                **calibration_kwargs,
+            )
+            layer1_hf_calibration_loaded = True
+        layer1_hf_objective = OnlinePerImageLayer1HighFrequencyEnergy(
+            calibration=layer1_hf_calibration,
+            **calibration_kwargs,
+        )
+        layer1_hf_objective.eval()
+    training_dataset = IndexedDataset(train_set) if layer1_hf_enabled else train_set
+    feature_energy_layer = (
+        'layer1' if layer1_hf_enabled else 'layer4'
+    )
+    feature_energy_top_ratio = (
+        args.layer1_hf_channel_ratio
+        if layer1_hf_enabled
+        else FEATURE_ENERGY_TOP_RATIO
+    )
     data_loader_generator = torch.Generator(device="cpu")
     data_loader_generator.manual_seed(args.seed)
     if resume_payload is not None:
@@ -3848,7 +4017,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             require_cuda=device.type == "cuda",
         )
     train_loader = build_training_data_loader(
-        train_set,
+        training_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
@@ -3872,6 +4041,14 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         except OSError:
             pass
         raise
+    if layer1_hf_enabled:
+        LOGGER.info(
+            'layer1_hf_calibration mode=%s loaded=%s path=%s sha256=%s',
+            'loaded_cache' if layer1_hf_calibration_loaded else 'online_epoch0',
+            layer1_hf_calibration_loaded,
+            args.layer1_hf_calibration_path or '<pending_epoch0>',
+            args.layer1_hf_calibration_sha256 or '<pending_epoch0>',
+        )
     LOGGER.info("args=%s", args)
     LOGGER.info("controller_config=%s", controller_config)
     LOGGER.info("generator_initialization=%s", initialization_contract)
@@ -3954,14 +4131,26 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             "batch_size or EOT samples if memory is insufficient",
             args.layer1_dropout_eot_samples + 1,
         )
-    LOGGER.info(
-        "feature_energy_loss mode=%s lambda=%.9g layer=layer4 top_ratio=%.6g "
-        "energy=mean_hw_squared_delta normalization=clean_mean_chw_squared "
-        "reward=mean_log1p_topk source_model_only=True",
-        args.feature_energy_loss_mode,
-        args.feature_energy_loss_lambda,
-        FEATURE_ENERGY_TOP_RATIO,
-    )
+    if layer1_hf_enabled:
+        LOGGER.info(
+            'feature_energy_loss mode=%s lambda=%.9g layer=layer1 '
+            'top_ratio=%.6g selection=online_epoch0_per_image_clean_topk '
+            'energy=dropout_fft_ifft_real_mean_square '
+            'normalization=per_channel_clean_mean_plus_median_ridge '
+            'reward=mean_log1p_absolute_adv_energy '
+            'clean_hf_only_on_first_encounter=True source_model_only=True',
+            args.feature_energy_loss_mode, args.feature_energy_loss_lambda,
+            feature_energy_top_ratio,
+        )
+    else:
+        LOGGER.info(
+            'feature_energy_loss mode=%s lambda=%.9g layer=layer4 '
+            'top_ratio=%.6g energy=mean_hw_squared_delta '
+            'normalization=clean_mean_chw_squared '
+            'reward=mean_log1p_topk source_model_only=True',
+            args.feature_energy_loss_mode, args.feature_energy_loss_lambda,
+            FEATURE_ENERGY_TOP_RATIO,
+        )
     LOGGER.info("dataset_contract=%s", dataset_manifest)
     LOGGER.info(
         "data_loader num_workers=%d persistent_workers=%s "
@@ -3972,15 +4161,22 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
     )
 
     for epoch in range(start_epoch, args.epochs):
-        lambda1_applied = (
-            float(controller_state.lambda1)
-            if args.ddsc_mode == "off"
-            else lambda1_for_epoch(
-                epoch,
-                args.ddsc_warmup_epochs,
-                controller_state,
+        if layer1_hf_enabled and args.ddsc_mode == 'off':
+            lambda1_applied = (
+                0.0
+                if epoch < args.ddsc_warmup_epochs
+                else float(controller_state.lambda1)
             )
-        )
+        else:
+            lambda1_applied = (
+                float(controller_state.lambda1)
+                if args.ddsc_mode == 'off'
+                else lambda1_for_epoch(
+                    epoch,
+                    args.ddsc_warmup_epochs,
+                    controller_state,
+                )
+            )
         intersection_active = (
             args.intersection_reg_mode != "off"
             and intersection_regularization_active(
@@ -4019,16 +4215,27 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             num_workers=args.num_workers,
             worker_timeout_seconds=args.worker_timeout_seconds,
         )
-        for batch_index, (image, ground_truth) in enumerate(
+        for batch_index, training_batch in enumerate(
             tqdm(training_batches, total=len(train_loader))
         ):
+            if layer1_hf_enabled:
+                image, ground_truth, sample_index = training_batch
+            else:
+                image, ground_truth = training_batch
+                sample_index = None
             image = image.to(device, non_blocking=True)
             ground_truth = ground_truth.to(device, non_blocking=True)
             structured_mask: torch.Tensor | None = None
             clean_capture_context = (
                 capture_resnet_layer4_features(clean_attack_model)
-                if feature_energy_enabled
-                else nullcontext(None)
+                if layer4_feature_energy_enabled else (
+                    capture_resnet_layer1_features(clean_attack_model)
+                    if (
+                        layer1_hf_enabled
+                        and layer1_hf_objective.needs_clean_record(sample_index)
+                    )
+                    else nullcontext(None)
+                )
             )
             with clean_capture_context as clean_capture:
                 if args.architecture_mode == "egs_tsaa":
@@ -4044,12 +4251,18 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                         )
             clean_layer4_feature = (
                 captured_resnet_layer4_batch(
-                    clean_capture,
-                    batch_size=image.shape[0],
+                    clean_capture, batch_size=image.shape[0]
                 ).detach()
-                if clean_capture is not None
+                if layer4_feature_energy_enabled
                 else None
             )
+            if layer1_hf_enabled and clean_capture is not None:
+                clean_layer1_feature = captured_resnet_layer1_batch(
+                    clean_capture, batch_size=image.shape[0]
+                ).detach()
+                layer1_hf_objective.record_clean(
+                    clean_layer1_feature, sample_index
+                )
             clean_prediction = clean_logits.argmax(dim=-1)
             if args.target == -1:
                 attack_label = clean_prediction
@@ -4142,11 +4355,16 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                         eps=args.intersection_reg_eps,
                     )
             objective_cw = cw_loss if args.architecture_mode == "simple" else legacy_cw_loss
-            adversarial_capture_context = (
-                capture_resnet_layer4_features(clean_attack_model)
-                if feature_energy_enabled
-                else nullcontext(None)
-            )
+            if layer4_feature_energy_enabled:
+                adversarial_capture_context = capture_resnet_layer4_features(
+                    clean_attack_model
+                )
+            elif layer1_hf_enabled:
+                adversarial_capture_context = capture_resnet_layer1_features(
+                    clean_attack_model
+                )
+            else:
+                adversarial_capture_context = nullcontext(None)
             with adversarial_capture_context as adversarial_capture:
                 loss_adv, adv_logits = attack_model_loss_and_logits(
                     attack_objective_model,
@@ -4157,16 +4375,23 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                         targeted=args.target != -1,
                     ),
                 )
-            if adversarial_capture is not None:
+            if layer4_feature_energy_enabled:
                 if clean_layer4_feature is None:
-                    raise RuntimeError("clean layer4 feature was not captured")
+                    raise RuntimeError('clean layer4 feature was not captured')
                 adversarial_layer4_feature = captured_resnet_layer4_batch(
-                    adversarial_capture,
-                    batch_size=image.shape[0],
+                    adversarial_capture, batch_size=image.shape[0]
                 )
                 feature_energy_reward = top10_channel_energy_reward(
-                    clean_layer4_feature,
-                    adversarial_layer4_feature,
+                    clean_layer4_feature, adversarial_layer4_feature
+                )
+            elif layer1_hf_enabled:
+                if layer1_hf_objective is None:
+                    raise RuntimeError('layer1 HF objective was not initialized')
+                adversarial_layer1_feature = captured_resnet_layer1_batch(
+                    adversarial_capture, batch_size=image.shape[0]
+                )
+                feature_energy_reward = layer1_hf_objective(
+                    adversarial_layer1_feature, sample_index
                 )
             else:
                 feature_energy_reward = loss_adv.new_zeros(())
@@ -4315,12 +4540,13 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 if feature_energy_enabled:
                     LOGGER.info(
                         "FEATURE_ENERGY_BATCH epoch=%d batch=%d reward=%.9g "
-                        "weighted_loss=%.9g layer=layer4 top_ratio=%.6g",
+                        "weighted_loss=%.9g layer=%s top_ratio=%.6g",
                         epoch,
                         batch_index,
                         last_metrics["feature_energy_reward"],
                         last_metrics["feature_energy_weighted"],
-                        FEATURE_ENERGY_TOP_RATIO,
+                        feature_energy_layer,
+                        feature_energy_top_ratio,
                     )
                 if hard_overlap_metrics is not None:
                     LOGGER.info(
@@ -4387,11 +4613,12 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         if feature_energy_enabled:
             LOGGER.info(
                 "FEATURE_ENERGY_EPOCH epoch=%d reward=%.9g weighted_loss=%.9g "
-                "layer=layer4 top_ratio=%.6g",
+                "layer=%s top_ratio=%.6g",
                 epoch,
                 mean_feature_energy_reward,
                 -args.feature_energy_loss_lambda * mean_feature_energy_reward,
-                FEATURE_ENERGY_TOP_RATIO,
+                feature_energy_layer,
+                feature_energy_top_ratio,
             )
         LOGGER.info(
             "HARD_OVERLAP_EPOCH epoch=%d hard_intersection_density=%.9g "
@@ -4455,6 +4682,30 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 previous_net_g.eval()
                 if hasattr(previous_net_g, "evaluate"):
                     setattr(previous_net_g, "evaluate", True)
+
+        if (
+            layer1_hf_enabled
+            and not args.layer1_hf_calibration_sha256
+        ):
+            calibration_output = (
+                output_path / 'per_image_layer1_hf_calibration.pth'
+            )
+            layer1_hf_calibration = (
+                layer1_hf_objective.export_calibration()
+            )
+            calibration_sha256 = save_calibration_cache(
+                layer1_hf_calibration, calibration_output
+            )
+            args.layer1_hf_calibration_path = str(calibration_output)
+            args.layer1_hf_calibration_sha256 = calibration_sha256
+            LOGGER.info(
+                'layer1_hf_calibration saved path=%s sha256=%s '
+                'samples=%d channels=%d selected_per_image=%d',
+                calibration_output, calibration_sha256,
+                layer1_hf_calibration.dataset_size,
+                layer1_hf_calibration.channel_count,
+                layer1_hf_calibration.selected_count,
+            )
 
         if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
             inference_path, training_path = save_epoch_checkpoints(
