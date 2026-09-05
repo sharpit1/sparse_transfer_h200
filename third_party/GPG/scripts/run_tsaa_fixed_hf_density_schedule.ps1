@@ -11,8 +11,6 @@ $gpgRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $python = 'C:\Users\raist\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
 $venv = 'D:\projects\sPGD_transfer\.venv'
 $sitePackages = Join-Path $venv 'Lib\site-packages'
-$sourceCheckpoint = 'D:\projects\sparse_transfer\atifact\baseline_models\baseline_models\TSAA_netG_-1_res50_train_2.pth'
-$sourceSha256 = '1e5c1d4f6f423a22e42ccb1ec17e74ac8cb725f153c3052b94b753e6291b0f54'
 $runRoot = Join-Path $gpgRoot (Join-Path 'runs' $RunId)
 $outputRoot = Join-Path $runRoot 'training'
 $stdoutPath = Join-Path $runRoot 'train.stdout.log'
@@ -33,6 +31,7 @@ function Write-State {
         target_density = 0.105
         feature_energy_loss_mode = 'layer1_hf_change'
         feature_energy_loss_lambda = 1.0
+        generator_initialization = 'random_seed_42'
         exit_code = $ExitCode
         updated_at = (Get-Date).ToString('o')
         message = $Message
@@ -45,14 +44,10 @@ if (Test-Path -LiteralPath $runRoot) {
 New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
 
 try {
-    foreach ($requiredPath in @($python, $sitePackages, $sourceCheckpoint)) {
+    foreach ($requiredPath in @($python, $sitePackages)) {
         if (-not (Test-Path -LiteralPath $requiredPath)) {
             throw "Required path is missing: $requiredPath"
         }
-    }
-    $observedSha256 = (Get-FileHash -LiteralPath $sourceCheckpoint -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($observedSha256 -ne $sourceSha256) {
-        throw "Source checkpoint SHA-256 mismatch: $observedSha256"
     }
 
     $env:VIRTUAL_ENV = $venv
@@ -84,8 +79,6 @@ try {
         '--lam_3', '0',
         '--pb', 'full',
         '--load_CP', 'New',
-        '--init_generator_checkpoint', $sourceCheckpoint,
-        '--init_generator_checkpoint_sha256', $sourceSha256,
         '--out-dir', $outputRoot,
         '--device', 'cuda:0',
         '--num_workers', '12',
