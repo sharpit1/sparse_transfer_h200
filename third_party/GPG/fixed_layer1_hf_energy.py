@@ -1,4 +1,4 @@
-"""Online per-image clean-ranked layer1 high-frequency energy objective."""
+"""Online per-image clean-ranked layer1 high-frequency energy objectives."""
 
 from __future__ import annotations
 
@@ -31,6 +31,11 @@ DEFAULT_LOW_FREQUENCY_RATIO = 0.35
 DEFAULT_RIDGE_FRACTION = 1.0e-3
 DEFAULT_DENOMINATOR_EPS = 1.0e-12
 PROGRESS_INTERVAL = 128_000
+ABSOLUTE_ADVERSARIAL_REWARD = "absolute_adversarial_energy_ratio"
+HIGH_FREQUENCY_CHANGE_REWARD = "high_frequency_feature_change_energy"
+REWARD_MODES = frozenset(
+    {ABSOLUTE_ADVERSARIAL_REWARD, HIGH_FREQUENCY_CHANGE_REWARD}
+)
 
 
 def _require_ratio(name: str, value: float) -> float:
@@ -194,7 +199,7 @@ class PerImageLayer1HFCalibration:
 
 
 class OnlinePerImageLayer1HighFrequencyEnergy(nn.Module):
-    """Record clean profiles on first use and reward the same batch's adv energy."""
+    """Record clean profiles and reward absolute or clean-to-adv HF energy."""
 
     def __init__(
         self,
@@ -205,6 +210,7 @@ class OnlinePerImageLayer1HighFrequencyEnergy(nn.Module):
         channel_ratio: float = DEFAULT_CHANNEL_RATIO,
         low_frequency_ratio: float = DEFAULT_LOW_FREQUENCY_RATIO,
         ridge_fraction: float = DEFAULT_RIDGE_FRACTION,
+        reward_mode: str = ABSOLUTE_ADVERSARIAL_REWARD,
         calibration: PerImageLayer1HFCalibration | None = None,
         denominator_eps: float = DEFAULT_DENOMINATOR_EPS,
     ) -> None:
@@ -221,6 +227,9 @@ class OnlinePerImageLayer1HighFrequencyEnergy(nn.Module):
         if not math.isfinite(ridge_fraction) or ridge_fraction < 0.0:
             raise ValueError("ridge_fraction must be finite and non-negative")
         self.ridge_fraction = float(ridge_fraction)
+        if reward_mode not in REWARD_MODES:
+            raise ValueError(f"unsupported layer1 HF reward mode: {reward_mode!r}")
+        self.reward_mode = reward_mode
         if not math.isfinite(denominator_eps) or denominator_eps <= 0.0:
             raise ValueError("denominator_eps must be finite and positive")
         self.denominator_eps = float(denominator_eps)
@@ -337,7 +346,13 @@ class OnlinePerImageLayer1HighFrequencyEnergy(nn.Module):
             selected_clean_energy=self.selected_clean_energy,
         ).validate()
 
-    def forward(self, adversarial_layer1_feature: Tensor, sample_indices: Tensor) -> Tensor:
+    def forward(
+        self,
+        adversarial_layer1_feature: Tensor,
+        sample_indices: Tensor,
+        *,
+        clean_layer1_feature: Tensor | None = None,
+    ) -> Tensor:
         if adversarial_layer1_feature.ndim != 4:
             raise ValueError("adversarial layer1 feature must have shape BxCxHxW")
         batch_size, channels, height, width = adversarial_layer1_feature.shape
@@ -358,14 +373,38 @@ class OnlinePerImageLayer1HighFrequencyEnergy(nn.Module):
             -1, -1, height, width
         )
         selected_feature = adversarial_layer1_feature.gather(1, gather_indices)
-        adversarial_energy = dropout_style_high_frequency_energy(
-            selected_feature, self.low_frequency_ratio
-        )
         ridge = (self.ridge_fraction * clean_energy.median(dim=1).values).clamp_min(
             self.denominator_eps
         )
-        return torch.log1p(
-            adversarial_energy / (clean_energy + ridge.unsqueeze(1))
+        denominator = clean_energy + ridge.unsqueeze(1)
+
+        if self.reward_mode == ABSOLUTE_ADVERSARIAL_REWARD:
+            adversarial_energy = dropout_style_high_frequency_energy(
+                selected_feature, self.low_frequency_ratio
+            )
+            normalized_energy = adversarial_energy / denominator
+            return torch.log(normalized_energy).mean()
+
+        if clean_layer1_feature is None:
+            raise ValueError(
+                "clean layer1 feature is required for high-frequency change energy"
+            )
+        if clean_layer1_feature.shape != adversarial_layer1_feature.shape:
+            raise ValueError(
+                "clean/adversarial layer1 features must have the same BxCxHxW shape"
+            )
+        selected_clean_feature = clean_layer1_feature.detach().gather(
+            1, gather_indices
+        )
+        # Match the post-hoc measurement: subtract features first, then project
+        # that displacement onto the spatial high-frequency band.
+        change_energy = dropout_style_high_frequency_energy(
+            selected_feature - selected_clean_feature,
+            self.low_frequency_ratio,
+        )
+        normalized_change_energy = change_energy / denominator
+        return torch.log(
+            normalized_change_energy.clamp_min(self.denominator_eps)
         ).mean()
 
 
@@ -470,12 +509,14 @@ def captured_resnet_layer1_batch(
 
 
 __all__ = [
+    "ABSOLUTE_ADVERSARIAL_REWARD",
     "CALIBRATION_SCHEMA",
     "DEFAULT_CHANNEL_RATIO",
     "DEFAULT_DENOMINATOR_EPS",
     "DEFAULT_LOW_FREQUENCY_RATIO",
     "DEFAULT_RIDGE_FRACTION",
     "IndexedDataset",
+    "HIGH_FREQUENCY_CHANGE_REWARD",
     "MEASUREMENT_CONTRACT",
     "OnlinePerImageLayer1HighFrequencyEnergy",
     "PerImageLayer1HFCalibration",

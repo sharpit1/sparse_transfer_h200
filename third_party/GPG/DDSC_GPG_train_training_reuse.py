@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 BASE_TRAINER = Path(__file__).resolve().with_name("DDSC_GPG_train.py")
-BASE_SHA256 = "dd69359d3c3527652d09b769398bf78667cb2f7b575228004ea34dc43b03b5ba"
+BASE_SHA256 = "b2ae3134f2f99f3ce06222f62efcad8e0c1798f2307d80d6a2384c71d5eadddf"
 
 
 def replace_once(source: str, old: str, new: str, label: str) -> str:

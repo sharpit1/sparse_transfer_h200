@@ -59,9 +59,11 @@ from torch.utils.data import Subset
 from tqdm import tqdm
 try:
     from .fixed_layer1_hf_energy import (
+        ABSOLUTE_ADVERSARIAL_REWARD,
         DEFAULT_CHANNEL_RATIO,
         DEFAULT_LOW_FREQUENCY_RATIO,
         DEFAULT_RIDGE_FRACTION,
+        HIGH_FREQUENCY_CHANGE_REWARD,
         IndexedDataset,
         OnlinePerImageLayer1HighFrequencyEnergy,
         calibration_cache_sha256,
@@ -72,9 +74,11 @@ try:
     )
 except ImportError:
     from fixed_layer1_hf_energy import (  # type: ignore[no-redef]
+        ABSOLUTE_ADVERSARIAL_REWARD,
         DEFAULT_CHANNEL_RATIO,
         DEFAULT_LOW_FREQUENCY_RATIO,
         DEFAULT_RIDGE_FRACTION,
+        HIGH_FREQUENCY_CHANGE_REWARD,
         IndexedDataset,
         OnlinePerImageLayer1HighFrequencyEnergy,
         calibration_cache_sha256,
@@ -194,7 +198,12 @@ FEATURE_ENERGY_LOSS_DEFAULTS = {
     "feature_energy_loss_lambda": 0.0,
 }
 FEATURE_ENERGY_TOP_RATIO = 0.1
-FIXED_LAYER1_HF_MODE = 'fixed_per_image_layer1_hf_top30_abs'
+FIXED_LAYER1_HF_ABSOLUTE_MODE = 'fixed_per_image_layer1_hf_top30_abs'
+FIXED_LAYER1_HF_CHANGE_MODE = 'layer1_hf_change'
+FIXED_LAYER1_HF_MODE = FIXED_LAYER1_HF_CHANGE_MODE
+FIXED_LAYER1_HF_MODES = frozenset(
+    {FIXED_LAYER1_HF_ABSOLUTE_MODE, FIXED_LAYER1_HF_CHANGE_MODE}
+)
 LAYER1_HF_DEFAULTS = {
     'layer1_hf_channel_ratio': DEFAULT_CHANNEL_RATIO,
     'layer1_hf_low_frequency_ratio': DEFAULT_LOW_FREQUENCY_RATIO,
@@ -240,6 +249,7 @@ RESUME_EXACT_ARGS = (
     *PGD_GUIDANCE_DEFAULTS,
     "ddsc_target_density",
     "ddsc_warmup_epochs",
+    "ddsc_control_start_epoch",
     "ddsc_ema_decay",
     "ddsc_mass",
     "ddsc_damping",
@@ -690,14 +700,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--feature_energy_loss_mode",
         "--feature-energy-loss-mode",
         dest="feature_energy_loss_mode",
-        choices=("off", "top10_channel_energy", FIXED_LAYER1_HF_MODE),
+        choices=("off", "top10_channel_energy", *sorted(FIXED_LAYER1_HF_MODES)),
         default=FEATURE_ENERGY_LOSS_DEFAULTS["feature_energy_loss_mode"],
         help=(
             "top10_channel_energy preserves the existing per-sample layer4 "
-            "change reward; fixed_per_image_layer1_hf_top30_abs selects "
-            "each image's clean-ranked layer1 channels once and rewards "
-            "their absolute adversarial dropout-style high-frequency "
-            "energy"
+            "change reward; fixed_per_image_layer1_hf_top30_abs rewards "
+            "absolute adversarial HF energy, while "
+            "layer1_hf_change rewards the HF energy "
+            "of the clean-to-adversarial feature displacement. Both fixed "
+            "modes select each image's clean-ranked layer1 channels once"
         ),
     )
     parser.add_argument(
@@ -874,6 +885,18 @@ def build_parser() -> argparse.ArgumentParser:
             "--ddsc_mode off"
         ),
     )
+    parser.add_argument(
+        "--ddsc_control_start_epoch",
+        "--ddsc-control-start-epoch",
+        dest="ddsc_control_start_epoch",
+        type=int,
+        default=None,
+        help=(
+            "first epoch whose observed density updates lambda-1; defaults to "
+            "--ddsc_warmup_epochs. Between warm-up and this epoch, lambda-1 "
+            "stays at its current value"
+        ),
+    )
     parser.add_argument("--ddsc_ema_decay", type=float, default=0.0)
     parser.add_argument("--ddsc_mass", type=float, default=1.0)
     parser.add_argument("--ddsc_damping", type=float, default=0.25)
@@ -948,6 +971,13 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.ddsc_warmup_epochs < 0:
         raise ValueError("ddsc_warmup_epochs must be non-negative")
+    if args.ddsc_control_start_epoch is None:
+        args.ddsc_control_start_epoch = args.ddsc_warmup_epochs
+    if args.ddsc_control_start_epoch < args.ddsc_warmup_epochs:
+        raise ValueError(
+            "ddsc_control_start_epoch must be greater than or equal to "
+            "ddsc_warmup_epochs"
+        )
     if not 0.0 < args.ddsc_target_density <= 1.0:
         raise ValueError("ddsc_target_density must be in (0, 1]")
     if args.target < -1 or args.target >= 1000:
@@ -1032,7 +1062,7 @@ def validate_args(args: argparse.Namespace) -> None:
             "is enabled"
         )
     valid_feature_energy_modes = {
-        'off', 'top10_channel_energy', FIXED_LAYER1_HF_MODE
+        'off', 'top10_channel_energy', *FIXED_LAYER1_HF_MODES
     }
     if args.feature_energy_loss_mode not in valid_feature_energy_modes:
         raise ValueError(
@@ -1066,7 +1096,7 @@ def validate_args(args: argparse.Namespace) -> None:
     ):
         raise ValueError('layer1_hf_ridge_fraction must be finite and non-negative')
     if (
-        args.feature_energy_loss_mode == FIXED_LAYER1_HF_MODE
+        args.feature_energy_loss_mode in FIXED_LAYER1_HF_MODES
         and args.load_CP == 'Continue'
         and (
             not args.layer1_hf_calibration_path
@@ -1094,7 +1124,7 @@ def validate_args(args: argparse.Namespace) -> None:
             'layer1_hf_calibration_sha256 must be 64 lowercase hex characters'
         )
     if (
-        args.feature_energy_loss_mode == FIXED_LAYER1_HF_MODE
+        args.feature_energy_loss_mode in FIXED_LAYER1_HF_MODES
         and bool(args.layer1_hf_calibration_path)
         != bool(args.layer1_hf_calibration_sha256)
     ):
@@ -1102,7 +1132,7 @@ def validate_args(args: argparse.Namespace) -> None:
             'layer1 HF calibration path and SHA-256 must be provided together'
         )
     if (
-        args.feature_energy_loss_mode != FIXED_LAYER1_HF_MODE
+        args.feature_energy_loss_mode not in FIXED_LAYER1_HF_MODES
         and (
             args.layer1_hf_calibration_path
             or args.layer1_hf_calibration_sha256
@@ -1223,6 +1253,10 @@ def _normalize_checkpoint_train_args(
     normalized = dict(stored_args)
     for key, value in LAYER1_HF_DEFAULTS.items():
         normalized.setdefault(key, value)
+    normalized.setdefault(
+        "ddsc_control_start_epoch",
+        normalized.get("ddsc_warmup_epochs", 3),
+    )
     # Checkpoints written before decoder topology became configurable used the
     # shared decoder exclusively.  Preserve exact continuation for those runs.
     normalized.setdefault("decoder_mode", "shared")
@@ -3202,7 +3236,7 @@ def validate_resume_metadata(
     expected_updates = (
         0
         if args.ddsc_mode == "off"
-        else max(0, next_epoch - args.ddsc_warmup_epochs)
+        else max(0, next_epoch - args.ddsc_control_start_epoch)
     )
     if state.update_index != expected_updates:
         raise ValueError(
@@ -3937,7 +3971,10 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         args.feature_energy_loss_mode == 'top10_channel_energy'
     )
     layer1_hf_enabled = (
-        args.feature_energy_loss_mode == FIXED_LAYER1_HF_MODE
+        args.feature_energy_loss_mode in FIXED_LAYER1_HF_MODES
+    )
+    layer1_hf_change_enabled = (
+        args.feature_energy_loss_mode == FIXED_LAYER1_HF_CHANGE_MODE
     )
     feature_energy_enabled = layer4_feature_energy_enabled or layer1_hf_enabled
     intersection_activation_epoch = (
@@ -3996,6 +4033,11 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             layer1_hf_calibration_loaded = True
         layer1_hf_objective = OnlinePerImageLayer1HighFrequencyEnergy(
             calibration=layer1_hf_calibration,
+            reward_mode=(
+                HIGH_FREQUENCY_CHANGE_REWARD
+                if layer1_hf_change_enabled
+                else ABSOLUTE_ADVERSARIAL_REWARD
+            ),
             **calibration_kwargs,
         )
         layer1_hf_objective.eval()
@@ -4058,14 +4100,22 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             "ddsc_mode=off lambda1_fixed=%.9g warmup_and_controller_updates=False",
             controller_state.lambda1,
         )
-    elif args.epochs <= args.ddsc_warmup_epochs:
+    elif args.epochs <= args.ddsc_control_start_epoch:
         LOGGER.warning(
             "epoch budget ends during lambda1 warm-up; no controlled epoch runs"
         )
-    elif args.epochs == args.ddsc_warmup_epochs + 1:
+    elif args.epochs == args.ddsc_control_start_epoch + 1:
         LOGGER.warning(
             "the final epoch uses lambda1_init; the first feedback-adjusted "
             "lambda1 is saved but never applied in this run"
+        )
+    if args.ddsc_mode != "off":
+        LOGGER.info(
+            "ddsc_schedule warmup_epochs=%d fixed_lambda_start_epoch=%d "
+            "control_start_epoch=%d",
+            args.ddsc_warmup_epochs,
+            args.ddsc_warmup_epochs,
+            args.ddsc_control_start_epoch,
         )
     LOGGER.info(
         "generator_type=%s trainable_params=%d total_params=%d "
@@ -4132,16 +4182,28 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             args.layer1_dropout_eot_samples + 1,
         )
     if layer1_hf_enabled:
-        LOGGER.info(
-            'feature_energy_loss mode=%s lambda=%.9g layer=layer1 '
-            'top_ratio=%.6g selection=online_epoch0_per_image_clean_topk '
-            'energy=dropout_fft_ifft_real_mean_square '
-            'normalization=per_channel_clean_mean_plus_median_ridge '
-            'reward=mean_log1p_absolute_adv_energy '
-            'clean_hf_only_on_first_encounter=True source_model_only=True',
-            args.feature_energy_loss_mode, args.feature_energy_loss_lambda,
-            feature_energy_top_ratio,
-        )
+        if layer1_hf_change_enabled:
+            LOGGER.info(
+                'feature_energy_loss mode=%s lambda=%.9g layer=layer1 '
+                'top_ratio=%.6g selection=online_epoch0_per_image_clean_topk '
+                'energy=mean_hw_squared_high_projection_of_adv_minus_clean '
+                'normalization=per_channel_clean_hf_mean_plus_median_ridge '
+                'reward=mean_log_clamped_normalized_hf_change_energy '
+                'clean_layer1_captured_every_batch=True source_model_only=True',
+                args.feature_energy_loss_mode, args.feature_energy_loss_lambda,
+                feature_energy_top_ratio,
+            )
+        else:
+            LOGGER.info(
+                'feature_energy_loss mode=%s lambda=%.9g layer=layer1 '
+                'top_ratio=%.6g selection=online_epoch0_per_image_clean_topk '
+                'energy=dropout_fft_ifft_real_mean_square '
+                'normalization=per_channel_clean_mean_plus_median_ridge '
+                'reward=mean_log_absolute_adv_energy_ratio '
+                'clean_hf_only_on_first_encounter=True source_model_only=True',
+                args.feature_energy_loss_mode, args.feature_energy_loss_lambda,
+                feature_energy_top_ratio,
+            )
     else:
         LOGGER.info(
             'feature_energy_loss mode=%s lambda=%.9g layer=layer4 '
@@ -4226,13 +4288,20 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
             image = image.to(device, non_blocking=True)
             ground_truth = ground_truth.to(device, non_blocking=True)
             structured_mask: torch.Tensor | None = None
+            layer1_hf_needs_clean_record = (
+                layer1_hf_enabled
+                and layer1_hf_objective.needs_clean_record(sample_index)
+            )
             clean_capture_context = (
                 capture_resnet_layer4_features(clean_attack_model)
                 if layer4_feature_energy_enabled else (
                     capture_resnet_layer1_features(clean_attack_model)
                     if (
                         layer1_hf_enabled
-                        and layer1_hf_objective.needs_clean_record(sample_index)
+                        and (
+                            layer1_hf_change_enabled
+                            or layer1_hf_needs_clean_record
+                        )
                     )
                     else nullcontext(None)
                 )
@@ -4256,13 +4325,15 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 if layer4_feature_energy_enabled
                 else None
             )
+            clean_layer1_feature = None
             if layer1_hf_enabled and clean_capture is not None:
                 clean_layer1_feature = captured_resnet_layer1_batch(
                     clean_capture, batch_size=image.shape[0]
                 ).detach()
-                layer1_hf_objective.record_clean(
-                    clean_layer1_feature, sample_index
-                )
+                if layer1_hf_needs_clean_record:
+                    layer1_hf_objective.record_clean(
+                        clean_layer1_feature, sample_index
+                    )
             clean_prediction = clean_logits.argmax(dim=-1)
             if args.target == -1:
                 attack_label = clean_prediction
@@ -4391,7 +4462,9 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                     adversarial_capture, batch_size=image.shape[0]
                 )
                 feature_energy_reward = layer1_hf_objective(
-                    adversarial_layer1_feature, sample_index
+                    adversarial_layer1_feature,
+                    sample_index,
+                    clean_layer1_feature=clean_layer1_feature,
                 )
             else:
                 feature_energy_reward = loss_adv.new_zeros(())
@@ -4655,7 +4728,7 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
         else:
             controller_state, diagnostics = update_controller_after_epoch(
                 epoch=epoch,
-                warmup_epochs=args.ddsc_warmup_epochs,
+                warmup_epochs=args.ddsc_control_start_epoch,
                 state=controller_state,
                 config=controller_config,
                 observed_k=observed_k,
@@ -4665,9 +4738,9 @@ def _run_training_impl(args: argparse.Namespace) -> Path:
                 LOGGER.info("controller_update=%s", diagnostics)
             else:
                 LOGGER.info(
-                    "controller_update=skipped warmup_epoch=%d/%d",
+                    "controller_update=skipped pre_control_epoch=%d/%d",
                     epoch + 1,
-                    args.ddsc_warmup_epochs,
+                    args.ddsc_control_start_epoch,
                 )
 
         if (

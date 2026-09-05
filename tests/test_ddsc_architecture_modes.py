@@ -97,6 +97,57 @@ class ArchitectureModeContractTests(unittest.TestCase):
         ddsc_train.validate_args(alias)
         self.assertEqual(alias.architecture_mode, "egs_tsaa")
 
+    def test_ddsc_control_can_start_after_fixed_lambda_epochs(self) -> None:
+        parser = ddsc_train.build_parser()
+        args = parser.parse_args(
+            [
+                "--ddsc_warmup_epochs",
+                "3",
+                "--ddsc_control_start_epoch",
+                "12",
+            ]
+        )
+        ddsc_train.validate_args(args)
+        self.assertEqual(args.ddsc_warmup_epochs, 3)
+        self.assertEqual(args.ddsc_control_start_epoch, 12)
+
+        state = ddsc_train.initial_controller_state(
+            ddsc_train.controller_config_from_args(args)
+        )
+        self.assertEqual(ddsc_train.lambda1_for_epoch(2, 3, state), 0.0)
+        self.assertEqual(ddsc_train.lambda1_for_epoch(3, 3, state), args.lam_1)
+        unchanged, diagnostics = ddsc_train.update_controller_after_epoch(
+            epoch=11,
+            warmup_epochs=args.ddsc_control_start_epoch,
+            state=state,
+            config=ddsc_train.controller_config_from_args(args),
+            observed_k=6000.0,
+            target_k=5268,
+        )
+        self.assertEqual(unchanged, state)
+        self.assertIsNone(diagnostics)
+        updated, diagnostics = ddsc_train.update_controller_after_epoch(
+            epoch=12,
+            warmup_epochs=args.ddsc_control_start_epoch,
+            state=state,
+            config=ddsc_train.controller_config_from_args(args),
+            observed_k=6000.0,
+            target_k=5268,
+        )
+        self.assertEqual(updated.update_index, 1)
+        self.assertIsNotNone(diagnostics)
+
+        invalid = parser.parse_args(
+            [
+                "--ddsc_warmup_epochs",
+                "3",
+                "--ddsc_control_start_epoch",
+                "2",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "greater than or equal"):
+            ddsc_train.validate_args(invalid)
+
     def test_temporal_intersection_options_cover_all_architecture_modes(self) -> None:
         parser = ddsc_train.build_parser()
         for mode in ("simple", "gpg", "tsaa", "egs_tsaa"):
